@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import platform
+import subprocess
 import sys
 import tempfile
 import time
@@ -11,17 +12,16 @@ import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 DEFAULT_DEKART_URL = "https://cloud.dekart.xyz"
-MAX_STDIN_UPLOAD_BYTES = 100 * 1024 * 1024
 
 
 def build_parser():
     """Build CLI parser for dekart commands."""
     parser = argparse.ArgumentParser(
         prog="dekart",
-        description="Dekart CLI for auth, MCP tools, and uploads.",
+        description="Dekart CLI for auth, MCP tools, uploads, and snapshots.",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -36,6 +36,12 @@ def build_parser():
         "--no-browser",
         action="store_true",
         help="Print authorization URL without opening browser automatically.",
+    )
+    init.add_argument(
+        "--local-snapshot",
+        choices=("ask", "install", "skip"),
+        default="ask",
+        help="After auth, ask/install/skip local headless snapshot capability (default: ask).",
     )
 
     tools = subparsers.add_parser("tools", help="List MCP tools from configured Dekart.")
@@ -199,6 +205,74 @@ def build_parser():
         help="Write JSON payload to file path instead of stdout.",
     )
 
+    snapshot_local = subparsers.add_parser(
+        "snapshot-local",
+        help="Manage local headless snapshot rendering capability.",
+    )
+    snapshot_local.add_argument(
+        "action",
+        choices=("status", "install", "uninstall"),
+        help="Capability action.",
+    )
+    snapshot_local.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output.",
+    )
+    snapshot_local.add_argument(
+        "--purge",
+        action="store_true",
+        help="With uninstall: also run Playwright Chromium uninstall.",
+    )
+    snapshot_local.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print detailed install/uninstall diagnostics.",
+    )
+
+    snapshot = subparsers.add_parser(
+        "snapshot",
+        help="Render report snapshot PNG (local when enabled; remote when disabled or --remote-only).",
+    )
+    snapshot.add_argument("--report-id", required=True, help="Dekart report id.")
+    snapshot.add_argument(
+        "--out",
+        help="Output PNG path. Defaults to snapshot-<report-id>.png in current directory.",
+    )
+    snapshot.add_argument(
+        "--timeout",
+        type=int,
+        default=90,
+        help="Timeout seconds for snapshot calls/rendering (default: 90).",
+    )
+    snapshot.add_argument(
+        "--width",
+        type=int,
+        default=1600,
+        help="Local render viewport width (default: 1600).",
+    )
+    snapshot.add_argument(
+        "--height",
+        type=int,
+        default=900,
+        help="Local render viewport height (default: 900).",
+    )
+    snapshot.add_argument(
+        "--remote-only",
+        action="store_true",
+        help="Skip local render attempt and use remote snapshot endpoint only.",
+    )
+    snapshot.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON result metadata.",
+    )
+    snapshot.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print snapshot diagnostics.",
+    )
+
     return parser
 
 
@@ -225,6 +299,38 @@ def save_config(path, data):
     """Persist JSON config to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def get_local_snapshot_settings(config):
+    """Extract local snapshot settings from config payload."""
+    local_snapshot = config.get("local_snapshot", {})
+    if not isinstance(local_snapshot, dict):
+        local_snapshot = {}
+    enabled = bool(local_snapshot.get("enabled", False))
+    provider = str(local_snapshot.get("provider", "playwright")).strip() or "playwright"
+    installed_at = str(local_snapshot.get("installed_at", "")).strip()
+    return {
+        "enabled": enabled,
+        "provider": provider,
+        "installed_at": installed_at,
+    }
+
+
+def update_local_snapshot_settings(enabled, provider="playwright", installed_at=""):
+    """Update local snapshot capability flags in config."""
+    config_path = get_config_path()
+    config = load_config(config_path)
+    local_snapshot = config.get("local_snapshot", {})
+    if not isinstance(local_snapshot, dict):
+        local_snapshot = {}
+    local_snapshot["enabled"] = bool(enabled)
+    local_snapshot["provider"] = str(provider or "playwright").strip() or "playwright"
+    if installed_at:
+        local_snapshot["installed_at"] = installed_at
+    elif not enabled:
+        local_snapshot.pop("installed_at", None)
+    config["local_snapshot"] = local_snapshot
+    save_config(config_path, config)
 
 
 def is_valid_http_url(url):
@@ -358,6 +464,209 @@ def get_auth_headers():
     if not token:
         return None
     return {"Authorization": f"Bearer {token}"}
+
+
+def run_command_capture(cmd):
+    """Run subprocess and capture exit code/stdout/stderr as text."""
+    result = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "code": result.returncode,
+        "stdout": result.stdout or "",
+        "stderr": result.stderr or "",
+        "cmd": " ".join(cmd),
+    }
+
+
+def run_command_live(cmd):
+    """Run subprocess attached to current terminal for interactive progress."""
+    result = subprocess.run(
+        cmd,
+        check=False,
+    )
+    return {
+        "code": result.returncode,
+        "stdout": "",
+        "stderr": "",
+        "cmd": " ".join(cmd),
+    }
+
+
+def check_local_snapshot_runtime():
+    """Check whether local Playwright Chromium rendering is available."""
+    status = {
+        "provider": "playwright",
+        "available": False,
+        "reason": "",
+    }
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception:
+        status["reason"] = "Playwright Python package is not installed."
+        return status
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+        status["available"] = True
+        return status
+    except Exception as exc:
+        status["reason"] = f"Playwright Chromium runtime unavailable: {exc}"
+        return status
+
+
+def snapshot_token_from_render_url(render_url):
+    """Extract snapshot_token query param from snapshot render URL."""
+    try:
+        parsed = urlparse(str(render_url or "").strip())
+    except Exception:
+        return ""
+    if not parsed.query:
+        return ""
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    token_values = query.get("snapshot_token", [])
+    if not token_values:
+        return ""
+    return str(token_values[0]).strip()
+
+
+def install_local_snapshot_capability(debug=False, interactive=False):
+    """Install local Playwright Chromium capability for snapshot rendering."""
+    runtime = check_local_snapshot_runtime()
+    if runtime.get("available"):
+        update_local_snapshot_settings(
+            enabled=True,
+            provider="playwright",
+            installed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+        )
+        return {
+            "ok": True,
+            "steps": [],
+            "message": "Local snapshot capability already available.",
+        }
+
+    steps = []
+    install_steps = (
+        ("Installing Playwright Python package", [sys.executable, "-m", "pip", "install", "playwright"]),
+        ("Installing Chromium browser runtime", [sys.executable, "-m", "playwright", "install", "chromium"]),
+    )
+    for index, (title, cmd) in enumerate(install_steps, start=1):
+        if interactive:
+            print(f"[{index}/{len(install_steps)}] {title}...")
+            print(f"$ {' '.join(cmd)}")
+            step = run_command_live(cmd)
+            if debug:
+                print(f"exit: {step.get('code')}")
+        else:
+            step = run_command_capture(cmd)
+        steps.append(step)
+        if step.get("code") != 0:
+            return {
+                "ok": False,
+                "steps": steps,
+                "message": f"Command failed: {step.get('cmd')}",
+            }
+
+    runtime = check_local_snapshot_runtime()
+    if not runtime.get("available"):
+        return {
+            "ok": False,
+            "steps": steps,
+            "message": runtime.get("reason", "Local snapshot runtime check failed."),
+        }
+
+    update_local_snapshot_settings(
+        enabled=True,
+        provider="playwright",
+        installed_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+    )
+    return {
+        "ok": True,
+        "steps": steps,
+        "message": "Local snapshot capability installed.",
+    }
+
+
+def uninstall_local_snapshot_capability(purge=False):
+    """Disable local snapshot capability and optionally purge Chromium."""
+    purge_step = None
+    if purge:
+        purge_step = run_command_capture([sys.executable, "-m", "playwright", "uninstall", "chromium"])
+    update_local_snapshot_settings(enabled=False, provider="playwright", installed_at="")
+    ok = True if purge_step is None else purge_step.get("code") == 0
+    return {
+        "ok": ok,
+        "purge_step": purge_step,
+        "message": "Local snapshot capability disabled.",
+    }
+
+
+def render_local_snapshot_png(render_url, width, height, timeout_seconds):
+    """Render snapshot PNG bytes with local Playwright Chromium."""
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("Playwright is not installed. Run `dekart snapshot-local install`.") from exc
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            viewport={"width": width, "height": height},
+            ignore_https_errors=True,
+        )
+        page = context.new_page()
+        page.goto(render_url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
+        snapshot_token = snapshot_token_from_render_url(render_url)
+        if snapshot_token:
+            page.wait_for_function(
+                "(expectedToken) => window.__dekartSnapshotReadyToken === expectedToken",
+                arg=snapshot_token,
+                timeout=timeout_seconds * 1000,
+            )
+        else:
+            page.wait_for_timeout(1500)
+            for selector in ("canvas", ".kepler-gl", "img"):
+                try:
+                    page.wait_for_selector(selector, timeout=5000)
+                    break
+                except Exception:
+                    continue
+        png_bytes = page.screenshot(type="png", timeout=timeout_seconds * 1000)
+        context.close()
+        browser.close()
+        return png_bytes
+
+
+def download_binary(url, timeout_seconds=30):
+    """Download binary payload from URL with optional auth headers."""
+    headers = {}
+    auth_headers = get_auth_headers()
+    if auth_headers:
+        headers.update(auth_headers)
+    request = urllib.request.Request(
+        url=url,
+        headers=headers,
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        return response.read()
+
+
+def parse_yes_no_input(value, default=True):
+    """Parse yes/no interactive input with default fallback."""
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return bool(default)
+    if normalized in {"y", "yes"}:
+        return True
+    if normalized in {"n", "no"}:
+        return False
+    return bool(default)
 
 
 def pretty_print_json(payload):
@@ -1134,46 +1443,52 @@ def resolve_upload_mime_type(source_name, explicit_mime_type):
     return guessed or "application/octet-stream"
 
 
-def load_upload_source(file_path, use_stdin):
-    """Load upload bytes from file path or stdin."""
+def stage_upload_source(file_path, use_stdin):
+    """Stage upload source as local file path, using temp file for stdin."""
     if bool(use_stdin) == bool(file_path):
         raise ValueError("Use exactly one input source: --file or --stdin.")
 
     if use_stdin:
-        body = bytearray()
-        chunk_size = 1024 * 1024
-        while True:
-            chunk = sys.stdin.buffer.read(chunk_size)
-            if not chunk:
-                break
-            body.extend(chunk)
-            if len(body) > MAX_STDIN_UPLOAD_BYTES:
-                raise ValueError(
-                    f"Stdin payload exceeds {MAX_STDIN_UPLOAD_BYTES} bytes (100 MiB). "
-                    "Use --file for larger uploads."
-                )
-        body = bytes(body)
-        if not body:
+        staged_file = tempfile.NamedTemporaryFile(prefix="dekart-upload-", suffix=".bin", delete=False)
+        total_size = 0
+        try:
+            chunk_size = 4 * 1024 * 1024
+            while True:
+                chunk = sys.stdin.buffer.read(chunk_size)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                staged_file.write(chunk)
+            staged_file.flush()
+        except Exception:
+            Path(staged_file.name).unlink(missing_ok=True)
+            raise
+        finally:
+            staged_file.close()
+        if total_size <= 0:
+            Path(staged_file.name).unlink(missing_ok=True)
             raise ValueError("Stdin is empty.")
-        return body, "stdin-upload.bin"
+        return Path(staged_file.name), "stdin-upload.bin", True
 
     local_file = Path(file_path)
     if not local_file.exists() or not local_file.is_file():
         raise ValueError(f"File not found: {local_file}")
-    file_bytes = local_file.read_bytes()
-    if not file_bytes:
+    file_size = local_file.stat().st_size
+    if file_size <= 0:
         raise ValueError("File is empty.")
-    return file_bytes, local_file.name
+    return local_file, local_file.name, False
 
 
 def handle_upload_file(file_path, use_stdin, file_id, name, mime_type, max_part_size, raw_json, out):
     """Upload one file end-to-end using MCP start/complete and CLI part PUT automation."""
+    staged_file = None
+    cleanup_staged_file = False
     try:
-        file_bytes, source_name = load_upload_source(file_path, use_stdin)
+        staged_file, source_name, cleanup_staged_file = stage_upload_source(file_path, use_stdin)
     except ValueError as exc:
         print(f"Invalid upload-file arguments: {exc}", file=sys.stderr)
         return 2
-    total_size = len(file_bytes)
+    total_size = staged_file.stat().st_size
 
     try:
         start_args = {
@@ -1187,8 +1502,8 @@ def handle_upload_file(file_path, use_stdin, file_id, name, mime_type, max_part_
         if not isinstance(start_result, dict):
             raise ValueError("Invalid start_file_upload_session response.")
 
-        upload_payload = upload_parts_from_bytes(
-            file_bytes=file_bytes,
+        upload_payload = upload_parts_from_start_result(
+            local_file=staged_file,
             start_result=start_result,
             upload_part_endpoint="",
             required_headers_json="",
@@ -1218,6 +1533,19 @@ def handle_upload_file(file_path, use_stdin, file_id, name, mime_type, max_part_
         return 2
     except urllib.error.HTTPError as exc:
         print(f"Upload-file request failed ({exc.code}): {exc.reason}", file=sys.stderr)
+        request_id = request_id_from_headers(getattr(exc, "headers", None))
+        if request_id:
+            print(f"request_id: {request_id}", file=sys.stderr)
+        raw_body, parsed_body = parse_http_error_body(exc)
+        fields = extract_structured_error_fields(parsed_body)
+        for key in ("error", "message", "path", "hint"):
+            value = fields.get(key, "").strip()
+            if value:
+                print(f"{key}: {value}", file=sys.stderr)
+        if exc.code == 413:
+            print("Upload rejected by Dekart size limit. Reduce file size or increase server upload limit.", file=sys.stderr)
+        if raw_body and not fields:
+            print(f"response: {raw_body}", file=sys.stderr)
         return 1
     except OSError as exc:
         print(f"Failed to write output file: {exc}", file=sys.stderr)
@@ -1225,6 +1553,233 @@ def handle_upload_file(file_path, use_stdin, file_id, name, mime_type, max_part_
     except Exception as exc:
         print(f"Upload-file failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if cleanup_staged_file and staged_file is not None:
+            try:
+                staged_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def handle_snapshot_local(action, raw_json, purge, debug):
+    """Handle local snapshot capability status/install/uninstall."""
+    config = load_config(get_config_path())
+    settings = get_local_snapshot_settings(config)
+    runtime = check_local_snapshot_runtime()
+
+    if action == "status":
+        payload = {
+            "enabled": settings.get("enabled", False),
+            "provider": settings.get("provider", "playwright"),
+            "installed_at": settings.get("installed_at", ""),
+            "runtime_available": runtime.get("available", False),
+            "runtime_reason": runtime.get("reason", ""),
+        }
+        if raw_json:
+            pretty_print_json(payload)
+        else:
+            print(f"Enabled: {payload['enabled']}")
+            print(f"Provider: {payload['provider']}")
+            print(f"Runtime available: {payload['runtime_available']}")
+            if payload.get("runtime_reason"):
+                print(f"Runtime note: {payload['runtime_reason']}")
+        return 0
+
+    if action == "install":
+        interactive_install = bool(not raw_json and sys.stdin.isatty() and sys.stdout.isatty())
+        if interactive_install:
+            print("Preparing local snapshot capability install.")
+            print("This installs Playwright and Chromium for local headless snapshot rendering.")
+            print()
+        result = install_local_snapshot_capability(debug=debug, interactive=interactive_install)
+        if raw_json:
+            payload = {
+                "action": "install",
+                "ok": bool(result.get("ok")),
+                "message": result.get("message", ""),
+                "steps": result.get("steps", []),
+            }
+            pretty_print_json(payload)
+        else:
+            print(result.get("message", ""))
+            if debug and not interactive_install:
+                for step in result.get("steps", []):
+                    print(f"command: {step.get('cmd')}")
+                    print(f"exit: {step.get('code')}")
+                    if step.get("stdout"):
+                        print(step.get("stdout").rstrip())
+                    if step.get("stderr"):
+                        print(step.get("stderr").rstrip(), file=sys.stderr)
+            if not result.get("ok"):
+                print("Install failed. You can retry with `dekart snapshot-local install --debug`.", file=sys.stderr)
+        return 0 if result.get("ok") else 1
+
+    if action == "uninstall":
+        result = uninstall_local_snapshot_capability(purge=purge)
+        purge_step = result.get("purge_step")
+        if raw_json:
+            payload = {
+                "action": "uninstall",
+                "ok": bool(result.get("ok")),
+                "message": result.get("message", ""),
+                "purge": purge,
+                "purge_step": purge_step,
+            }
+            pretty_print_json(payload)
+        else:
+            print(result.get("message", ""))
+            if purge_step and debug:
+                print(f"command: {purge_step.get('cmd')}")
+                print(f"exit: {purge_step.get('code')}")
+                if purge_step.get("stdout"):
+                    print(purge_step.get("stdout").rstrip())
+                if purge_step.get("stderr"):
+                    print(purge_step.get("stderr").rstrip(), file=sys.stderr)
+            print("To re-enable later run: dekart snapshot-local install")
+            if purge and purge_step and purge_step.get("code") != 0:
+                print("Chromium purge failed. Capability is disabled, but browser uninstall failed.", file=sys.stderr)
+        return 0 if result.get("ok") else 1
+
+    print(f"Unknown action: {action}", file=sys.stderr)
+    return 2
+
+
+def resolve_snapshot_output_path(report_id, out):
+    """Resolve PNG output path for snapshot command."""
+    default_name = f"snapshot-{report_id}.png"
+    return Path(out or default_name).expanduser()
+
+
+def save_binary_file(path, body):
+    """Write raw bytes to file path, creating parent directories."""
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(body)
+    return target
+
+
+def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_json, debug):
+    """Render report snapshot PNG locally when configured, else use remote endpoint."""
+    timeout_seconds = parse_int(timeout, 90)
+    if timeout_seconds <= 0:
+        print("Invalid --timeout: must be positive.", file=sys.stderr)
+        return 2
+    width_px = parse_int(width, 1600)
+    height_px = parse_int(height, 900)
+    if width_px <= 0 or height_px <= 0:
+        print("Invalid --width/--height: must be positive integers.", file=sys.stderr)
+        return 2
+
+    report_id_value = str(report_id or "").strip()
+    if not report_id_value:
+        print("Invalid --report-id.", file=sys.stderr)
+        return 2
+
+    try:
+        snapshot_payload = mcp_call("create_report_snapshot", {"report_id": report_id_value}, timeout_seconds=timeout_seconds)
+    except urllib.error.HTTPError as exc:
+        print(f"Snapshot request failed ({exc.code}): {exc.reason}", file=sys.stderr)
+        raw_body, parsed_body = parse_http_error_body(exc)
+        fields = extract_structured_error_fields(parsed_body)
+        for key in ("error", "message", "path", "hint"):
+            value = fields.get(key, "").strip()
+            if value:
+                print(f"{key}: {value}", file=sys.stderr)
+        if raw_body and not fields:
+            print(f"response: {raw_body}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Snapshot request failed: {exc}", file=sys.stderr)
+        return 1
+
+    result = snapshot_payload.get("result", {}) if isinstance(snapshot_payload, dict) else {}
+    if not isinstance(result, dict):
+        print("Invalid snapshot response payload.", file=sys.stderr)
+        return 1
+
+    snapshot_url = str(result.get("snapshot_url", "")).strip()
+    snapshot_render_url = str(result.get("snapshot_render_url", "")).strip()
+    expires_in = parse_int(result.get("expires_in"), 0)
+    config = load_config(get_config_path())
+    settings = get_local_snapshot_settings(config)
+    local_enabled = bool(settings.get("enabled", False))
+    prefer_local = (not remote_only) and local_enabled
+    can_attempt_local = prefer_local and bool(snapshot_render_url)
+    local_error = ""
+    source = "local" if prefer_local else "remote"
+    png_bytes = b""
+
+    if prefer_local:
+        if not snapshot_render_url:
+            print("Snapshot response did not include snapshot_render_url, but local snapshot is enabled.", file=sys.stderr)
+            print("Run with --remote-only to force remote snapshot.", file=sys.stderr)
+            return 1
+        try:
+            if debug:
+                print(f"[debug] local_snapshot_render_url={snapshot_render_url}", file=sys.stderr)
+            png_bytes = render_local_snapshot_png(
+                snapshot_render_url,
+                width=width_px,
+                height=height_px,
+                timeout_seconds=timeout_seconds,
+            )
+            source = "local"
+        except Exception as exc:
+            local_error = str(exc)
+            print(f"Local snapshot render failed: {local_error}", file=sys.stderr)
+            print("Remote fallback is disabled while local snapshot is enabled.", file=sys.stderr)
+            print("Use --remote-only to force remote snapshot.", file=sys.stderr)
+            return 1
+
+    if not png_bytes:
+        if not snapshot_url:
+            print("Snapshot response did not include snapshot_url.", file=sys.stderr)
+            return 1
+        try:
+            png_bytes = download_binary(snapshot_url, timeout_seconds=timeout_seconds)
+            source = "remote"
+        except urllib.error.HTTPError as exc:
+            print(f"Remote snapshot download failed ({exc.code}): {exc.reason}", file=sys.stderr)
+            raw_body, parsed_body = parse_http_error_body(exc)
+            fields = extract_structured_error_fields(parsed_body)
+            for key in ("error", "message", "path", "hint"):
+                value = fields.get(key, "").strip()
+                if value:
+                    print(f"{key}: {value}", file=sys.stderr)
+            if raw_body and not fields:
+                print(f"response: {raw_body}", file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(f"Remote snapshot download failed: {exc}", file=sys.stderr)
+            return 1
+
+    try:
+        output_path = resolve_snapshot_output_path(report_id_value, out)
+        save_binary_file(output_path, png_bytes)
+    except OSError as exc:
+        print(f"Failed to write snapshot file: {exc}", file=sys.stderr)
+        return 1
+
+    payload = {
+        "report_id": report_id_value,
+        "path": str(output_path),
+        "source": source,
+        "bytes": len(png_bytes),
+        "snapshot_url": snapshot_url,
+        "snapshot_render_url": snapshot_render_url,
+        "expires_in": expires_in,
+        "local_enabled": local_enabled,
+        "local_attempted": can_attempt_local,
+        "local_error": local_error,
+    }
+    if raw_json:
+        pretty_print_json(payload)
+    else:
+        print(f"Snapshot saved: {payload['path']}")
+        print(f"Source: {payload['source']}")
+        if local_error:
+            print(f"Local fallback reason: {local_error}")
+    return 0
 
 
 def build_device_name():
@@ -1234,7 +1789,7 @@ def build_device_name():
     return f"{node_name} ({system_name})"
 
 
-def handle_init(no_browser):
+def handle_init(no_browser, local_snapshot_mode):
     """Run device authorization flow and save returned Dekart CLI token."""
     dekart_url = get_dekart_url().rstrip("/")
     device_endpoint = f"{dekart_url}/api/v1/device"
@@ -1286,6 +1841,39 @@ def handle_init(no_browser):
             email = token_payload.get("email", "")
             print(f"Done. Authenticated as {email}")
             print(f"Token saved: {token_path}")
+            mode = str(local_snapshot_mode or "ask").strip().lower()
+            if mode == "install":
+                print("Installing optional local snapshot capability...")
+                install_result = install_local_snapshot_capability(
+                    debug=False,
+                    interactive=bool(sys.stdin.isatty() and sys.stdout.isatty()),
+                )
+                if install_result.get("ok"):
+                    print(install_result.get("message", "Local snapshot capability installed."))
+                else:
+                    print(install_result.get("message", "Failed to install local snapshot capability."), file=sys.stderr)
+                    print("You can retry later with `dekart snapshot-local install`.", file=sys.stderr)
+                    return 1
+            elif mode == "ask":
+                if sys.stdin.isatty() and sys.stdout.isatty():
+                    print()
+                    print("Optional: install local snapshot capability for faster local renders?")
+                    answer = input("Install now? [Y/n]: ")
+                    if parse_yes_no_input(answer, default=True):
+                        print("Installing local snapshot capability...")
+                        install_result = install_local_snapshot_capability(
+                            debug=False,
+                            interactive=bool(sys.stdin.isatty() and sys.stdout.isatty()),
+                        )
+                        if install_result.get("ok"):
+                            print(install_result.get("message", "Local snapshot capability installed."))
+                        else:
+                            print(install_result.get("message", "Failed to install local snapshot capability."), file=sys.stderr)
+                            print("You can retry later with `dekart snapshot-local install`.", file=sys.stderr)
+                    else:
+                        print("Skipped local snapshot install. You can install later with `dekart snapshot-local install`.")
+                else:
+                    print("Tip: install local snapshot capability later with `dekart snapshot-local install`.")
             return 0
         if status == "expired":
             print("Authorization expired. Run dekart init again.", file=sys.stderr)
@@ -1309,7 +1897,7 @@ def main():
     if args.command == "config":
         raise SystemExit(handle_config(args.url))
     if args.command == "init":
-        raise SystemExit(handle_init(args.no_browser))
+        raise SystemExit(handle_init(args.no_browser, args.local_snapshot))
     if args.command == "tools":
         raise SystemExit(handle_tools(args.json, args.names, args.match, args.schema, args.arg_keys))
     if args.command == "resolve-tools":
@@ -1353,6 +1941,28 @@ def main():
                 max_part_size=args.max_part_size,
                 raw_json=args.json,
                 out=args.out,
+            )
+        )
+    if args.command == "snapshot-local":
+        raise SystemExit(
+            handle_snapshot_local(
+                action=args.action,
+                raw_json=args.json,
+                purge=args.purge,
+                debug=args.debug,
+            )
+        )
+    if args.command == "snapshot":
+        raise SystemExit(
+            handle_snapshot(
+                report_id=args.report_id,
+                out=args.out,
+                timeout=args.timeout,
+                width=args.width,
+                height=args.height,
+                remote_only=args.remote_only,
+                raw_json=args.json,
+                debug=args.debug,
             )
         )
 

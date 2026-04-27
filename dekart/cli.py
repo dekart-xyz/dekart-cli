@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import platform
+import select
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 DEFAULT_DEKART_URL = "https://cloud.dekart.xyz"
+LOCALHOST_DEKART_URL = "http://localhost:8080"
 
 
 def build_parser():
@@ -667,6 +669,233 @@ def parse_yes_no_input(value, default=True):
     if normalized in {"n", "no"}:
         return False
     return bool(default)
+
+
+def is_interactive_terminal():
+    """Return True when both stdin/stdout are interactive terminals."""
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def supports_ansi_colors():
+    """Return True when ANSI color output is likely supported."""
+    if not sys.stdout.isatty():
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    term = os.environ.get("TERM", "").strip().lower()
+    return term not in {"", "dumb"}
+
+
+def ansi_rgb(text, red, green, blue, bold=False):
+    """Wrap text with 24-bit ANSI color escape sequence."""
+    if not supports_ansi_colors():
+        return text
+    style = "1;" if bold else ""
+    return f"\033[{style}38;2;{red};{green};{blue}m{text}\033[0m"
+
+
+def print_init_banner():
+    """Print Dekart init banner inspired by Dekart logo colors."""
+    lines = [
+        "  ____       _             _   ",
+        " |  _ \\  ___| | ____ _ _ __| |_ ",
+        " | | | |/ _ \\ |/ / _` | '__| __|",
+        " | |_| |  __/   < (_| | |  | |_ ",
+        " |____/ \\___|_|\\_\\__,_|_|   \\__|",
+        "                                ",
+    ]
+    for line in lines:
+        print(ansi_rgb(line, 112, 181, 208, bold=True))
+    subtitle = "Interactive setup for Dekart CLI"
+    print(ansi_rgb(subtitle, 43, 50, 59))
+    print()
+
+
+def read_menu_key():
+    """Read one key press and normalize it for interactive menus."""
+    if os.name == "nt":
+        import msvcrt
+
+        ch = msvcrt.getwch()
+        if ch in {"\r", "\n"}:
+            return "enter"
+        if ch in {"\x00", "\xe0"}:
+            ch2 = msvcrt.getwch()
+            if ch2 == "H":
+                return "up"
+            if ch2 == "P":
+                return "down"
+            return ""
+        if ch in {"k", "K"}:
+            return "up"
+        if ch in {"j", "J"}:
+            return "down"
+        return ""
+
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = os.read(fd, 1)
+        if ch == b"\x03":
+            raise KeyboardInterrupt
+        if ch in {b"\r", b"\n"}:
+            return "enter"
+        if ch in {b"k", b"K"}:
+            return "up"
+        if ch in {b"j", b"J"}:
+            return "down"
+        if ch == b"\x1b":
+            ready, _, _ = select.select([sys.stdin], [], [], 0.03)
+            if not ready:
+                return "cancel"
+            seq = os.read(fd, 2)
+            if seq == b"[A":
+                return "up"
+            if seq == b"[B":
+                return "down"
+            return ""
+        return ""
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def select_menu_option(title, options, default_index=0):
+    """Render interactive cursor menu and return selected option index."""
+    if not is_interactive_terminal() or not options or not supports_ansi_colors():
+        return None
+
+    selected = max(0, min(int(default_index), len(options) - 1))
+    cancelled = False
+    step_color = (112, 181, 208)
+
+    def format_line(index):
+        prefix = ">" if index == selected else " "
+        line = f"  {prefix} {options[index]}"
+        if index == selected:
+            return ansi_rgb(line, step_color[0], step_color[1], step_color[2], bold=True)
+        return line
+
+    try:
+        print(ansi_rgb(title, step_color[0], step_color[1], step_color[2], bold=True))
+        print("Use ↑/↓ (or j/k) and Enter.")
+        print()
+        for idx in range(len(options)):
+            print(format_line(idx))
+        if supports_ansi_colors():
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+
+        while True:
+            key = read_menu_key()
+            previous = selected
+            if key == "up":
+                selected = (selected - 1) % len(options)
+            elif key == "down":
+                selected = (selected + 1) % len(options)
+            elif key == "enter":
+                break
+            elif key == "cancel":
+                cancelled = True
+                break
+
+            if selected != previous:
+                sys.stdout.write(f"\033[{len(options)}F")
+                for idx in range(len(options)):
+                    sys.stdout.write("\033[2K\r" + format_line(idx) + "\n")
+                sys.stdout.flush()
+    except Exception:
+        return None
+    finally:
+        if supports_ansi_colors():
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+    print()
+    if cancelled:
+        return "cancel"
+    return selected
+
+
+def save_dekart_url(url):
+    """Persist Dekart URL into CLI config."""
+    normalized_url = str(url or "").strip().rstrip("/")
+    config_path = get_config_path()
+    config = load_config(config_path)
+    config["dekart_url"] = normalized_url
+    save_config(config_path, config)
+
+
+def prompt_init_dekart_url():
+    """Prompt user to select Dekart endpoint for init flow."""
+    print(ansi_rgb("[Step 1 of 3] Select Dekart endpoint", 112, 181, 208, bold=True))
+    print("Choose where this CLI should connect:")
+    current_url = get_dekart_url().rstrip("/")
+    default_index = 0
+    custom_default = ""
+    if current_url == LOCALHOST_DEKART_URL:
+        default_index = 1
+    elif current_url and current_url != DEFAULT_DEKART_URL:
+        default_index = 2
+        custom_default = current_url
+    options = [
+        f"Dekart Cloud (SaaS, default): {DEFAULT_DEKART_URL}",
+        f"Local Dekart: {LOCALHOST_DEKART_URL}",
+        "Custom URL",
+    ]
+    cursor_selection = select_menu_option(
+        title="Select endpoint option",
+        options=options,
+        default_index=default_index,
+    )
+    if cursor_selection == "cancel":
+        selected_url = current_url or DEFAULT_DEKART_URL
+        print("Selection cancelled. Keeping current endpoint.")
+        print(f"Selected endpoint: {selected_url}")
+        print("You can change it later with: dekart config --url <URL>")
+        print()
+        return selected_url
+
+    if cursor_selection is None:
+        print(f"  1) {options[0]}")
+        print(f"  2) {options[1]}")
+        print(f"  3) {options[2]}")
+        print()
+        default_choice = str(default_index + 1)
+        choice = input(f"Select [1/2/3] (default: {default_choice}): ").strip()
+        if not choice:
+            choice = default_choice
+        elif choice not in {"1", "2", "3"}:
+            print(f"Unknown choice '{choice}', defaulting to current endpoint.")
+            choice = default_choice
+    else:
+        choice = str(cursor_selection + 1)
+
+    if choice == "2":
+        selected_url = LOCALHOST_DEKART_URL
+    elif choice == "3":
+        while True:
+            if custom_default:
+                prompt = f"Enter custom http(s) URL (default: {custom_default}): "
+                custom = input(prompt).strip().rstrip("/")
+                if not custom:
+                    custom = custom_default
+            else:
+                custom = input("Enter custom http(s) URL: ").strip().rstrip("/")
+            if is_valid_http_url(custom):
+                selected_url = custom
+                break
+            print("Invalid URL. Example: https://my-dekart.company.com")
+    else:
+        selected_url = DEFAULT_DEKART_URL
+
+    print(f"Selected endpoint: {selected_url}")
+    print("This endpoint will be saved after successful authorization.")
+    print("You can change it later with: dekart config --url <URL>")
+    print()
+    return selected_url
 
 
 def pretty_print_json(payload):
@@ -1791,11 +2020,23 @@ def build_device_name():
 
 def handle_init(no_browser, local_snapshot_mode):
     """Run device authorization flow and save returned Dekart CLI token."""
-    dekart_url = get_dekart_url().rstrip("/")
+    interactive = is_interactive_terminal()
+    if interactive:
+        print_init_banner()
+        dekart_url = prompt_init_dekart_url().rstrip("/")
+    else:
+        dekart_url = get_dekart_url().rstrip("/")
+        print(ansi_rgb("[Step 1 of 3] Select Dekart endpoint", 112, 181, 208, bold=True))
+        print(f"Using Dekart endpoint: {dekart_url}")
+        print("Tip: change endpoint later with: dekart config --url <URL>")
+        print()
+
     device_endpoint = f"{dekart_url}/api/v1/device"
     token_endpoint = f"{dekart_url}/api/v1/device/token"
     token_path = get_token_path()
 
+    print(ansi_rgb("[Step 2 of 3] Authorize this device", 112, 181, 208, bold=True))
+    print("Registering device with Dekart...")
     try:
         start_payload = post_json(device_endpoint, {"device_name": build_device_name()})
     except urllib.error.HTTPError as exc:
@@ -1815,15 +2056,27 @@ def handle_init(no_browser, local_snapshot_mode):
         print("Invalid response from Dekart device endpoint.", file=sys.stderr)
         return 1
 
-    print("Opening browser to authorize...")
-    print(f"Auth URL: {auth_url}")
-    if not no_browser:
-        try:
-            webbrowser.open(auth_url, new=2, autoraise=True)
-        except Exception:
-            print("Could not open browser automatically. Open the URL manually.", file=sys.stderr)
+    print("Open this URL and approve access:")
+    print(f"  {auth_url}")
+    if no_browser:
+        print("Browser auto-open is disabled (--no-browser).")
+    elif interactive:
+        open_now = parse_yes_no_input(input("Open browser now? [y/N]: "), default=False)
+        if open_now:
+            print("Opening browser...")
+            try:
+                webbrowser.open(auth_url, new=2, autoraise=True)
+            except Exception:
+                print("Could not open browser automatically. Open the URL manually.", file=sys.stderr)
+                print("If browser does not open, open this link:", file=sys.stderr)
+                print(f"  {auth_url}", file=sys.stderr)
+        else:
+            print("Okay, open the link manually when ready.")
+    else:
+        print("Non-interactive mode: browser was not opened automatically.")
+        print("Open the link manually to continue authorization.")
 
-    print("Waiting for authorization...")
+    print(f"Waiting for authorization (poll every {interval}s, expires in {expires_in}s)...")
     deadline = time.monotonic() + expires_in
     while time.monotonic() <= deadline:
         try:
@@ -1837,43 +2090,79 @@ def handle_init(no_browser, local_snapshot_mode):
 
         status = str(token_payload.get("status", "")).strip()
         if status == "authorized" and token_payload.get("token"):
+            print("Finalizing setup...")
+            save_dekart_url(dekart_url)
             save_token(token_path, dekart_url, token_payload)
             email = token_payload.get("email", "")
             print(f"Done. Authenticated as {email}")
             print(f"Token saved: {token_path}")
             mode = str(local_snapshot_mode or "ask").strip().lower()
+            print()
+            print(ansi_rgb("[Step 3 of 3] Local snapshot setup", 112, 181, 208, bold=True))
             if mode == "install":
-                print("Installing optional local snapshot capability...")
+                print("Installing local snapshot capability for best snapshot performance...")
                 install_result = install_local_snapshot_capability(
                     debug=False,
-                    interactive=bool(sys.stdin.isatty() and sys.stdout.isatty()),
+                    interactive=interactive,
                 )
                 if install_result.get("ok"):
                     print(install_result.get("message", "Local snapshot capability installed."))
+                    print("Manage later with: dekart snapshot-local status|install|uninstall")
                 else:
                     print(install_result.get("message", "Failed to install local snapshot capability."), file=sys.stderr)
                     print("You can retry later with `dekart snapshot-local install`.", file=sys.stderr)
                     return 1
             elif mode == "ask":
-                if sys.stdin.isatty() and sys.stdout.isatty():
-                    print()
-                    print("Optional: install local snapshot capability for faster local renders?")
-                    answer = input("Install now? [Y/n]: ")
-                    if parse_yes_no_input(answer, default=True):
+                if interactive:
+                    print("Recommended: install local snapshot capability for best snapshot performance.")
+                    print("This helps large/complex maps render faster and avoids remote snapshot limits.")
+                    selection = select_menu_option(
+                        title="Choose local snapshot option",
+                        options=[
+                            "Install local snapshot now (recommended)",
+                            "Skip for now",
+                        ],
+                        default_index=0,
+                    )
+                    if selection is None:
+                        answer = input("Install now? [Y/n]: ")
+                        install_now = parse_yes_no_input(answer, default=True)
+                    else:
+                        install_now = selection == 0
+                    if install_now:
                         print("Installing local snapshot capability...")
                         install_result = install_local_snapshot_capability(
                             debug=False,
-                            interactive=bool(sys.stdin.isatty() and sys.stdout.isatty()),
+                            interactive=interactive,
                         )
                         if install_result.get("ok"):
                             print(install_result.get("message", "Local snapshot capability installed."))
+                            print("Manage later with: dekart snapshot-local status|install|uninstall")
                         else:
                             print(install_result.get("message", "Failed to install local snapshot capability."), file=sys.stderr)
                             print("You can retry later with `dekart snapshot-local install`.", file=sys.stderr)
                     else:
-                        print("Skipped local snapshot install. You can install later with `dekart snapshot-local install`.")
+                        print("Skipped local snapshot install.")
+                        print("You can enable later with: dekart snapshot-local install")
+                        print("You can disable/uninstall with: dekart snapshot-local uninstall")
                 else:
                     print("Tip: install local snapshot capability later with `dekart snapshot-local install`.")
+                    print("You can disable/uninstall with: dekart snapshot-local uninstall")
+            else:
+                print("Skipped local snapshot install (--local-snapshot skip).")
+                print("You can enable later with: dekart snapshot-local install")
+                print("You can disable/uninstall with: dekart snapshot-local uninstall")
+
+            local_snapshot_enabled = get_local_snapshot_settings(load_config(get_config_path())).get("enabled", False)
+            print()
+            print(ansi_rgb("Hey, success!", 112, 181, 208, bold=True))
+            print("Setup summary:")
+            print(f"  Endpoint: {dekart_url}")
+            print(f"  Account: {email}")
+            print(f"  Config: {get_config_path()}")
+            print(f"  Token: {token_path}")
+            print(f"  Local snapshot: {'enabled' if local_snapshot_enabled else 'disabled'}")
+            print("You can run `dekart init` again anytime.")
             return 0
         if status == "expired":
             print("Authorization expired. Run dekart init again.", file=sys.stderr)

@@ -1,103 +1,56 @@
 # dekart-cli
-Standalone Dekart CLI.
 
-## Install
+[Dekart](https://github.com/dekart-xyz/dekart) MCP wrapper for your AI agent to create maps from SQL query results.
 
-```bash
-pip install -e .
-```
+Works best with the [geosql](https://github.com/dekart-xyz/geosql) skill — it writes the SQL, this CLI renders the map.
 
-After install, command is:
+Works with any Dekart instance:
 
-```bash
-dekart --help
-```
+- **Dekart Cloud** (SaaS, default)
+- **Self-hosted** (your own URL)
+- **Localhost** (`http://localhost:8080`)
 
-## Config and auth
+## Init
 
 ```bash
-dekart config --url http://localhost:3000
+pip install dekart
 dekart init
 ```
 
-Config and token are stored under:
+`dekart init` walks you through:
 
-- `~/.config/dekart/config.json`
-- `~/.config/dekart/token.json`
+1. Picking the instance (Cloud / self-hosted / localhost).
+2. Authorizing the CLI in your browser.
+3. Optionally enabling local snapshots.
 
-After successful `dekart init`, the CLI can optionally install local snapshot capability.
-You can control this behavior with:
-
-```bash
-dekart init --local-snapshot ask      # default
-dekart init --local-snapshot install  # install right after auth
-dekart init --local-snapshot skip     # skip prompt/install
-```
-
-## MCP tools
+To switch instance later:
 
 ```bash
-dekart tools --json
-dekart call --name create_report --args '{}'
-dekart upload-file --file /tmp/result.csv --file-id <file-id>
+dekart config --url <your-url>
+dekart init
 ```
 
-You can also stream upload content from stdin:
+Config and token: `~/.config/dekart/`.
+
+## Enable local snapshot
+
+Local headless renderer for fast PNG snapshots without a round-trip to the server:
 
 ```bash
-bq query --use_legacy_sql=false --format=csv 'SELECT 1 AS x' \
-  | dekart upload-file --stdin --file-id <file-id> --name result.csv --mime-type text/csv
+dekart snapshot-local install
 ```
 
-`--stdin` is staged to a temporary file and uploaded in parts, so it avoids loading the full stream
-into memory. Total-size limits are enforced by Dekart server configuration.
-
-## Snapshots
-
-Render report PNG snapshots for agent verification:
-
-```bash
-dekart snapshot --report-id <report-id> --out ./snapshot.png
-```
-
-`dekart snapshot` uses local headless rendering when local snapshot is enabled.
-It uses remote snapshot only when local snapshot is disabled (or when you pass `--remote-only`).
-
-Manage local snapshot capability:
+Manage:
 
 ```bash
 dekart snapshot-local status
-dekart snapshot-local install
-dekart snapshot-local uninstall
+dekart snapshot-local uninstall          # remove renderer
+dekart snapshot-local uninstall --purge  # also remove its browser cache
 ```
 
-Optional full browser cleanup on uninstall:
+When local snapshot is enabled, `dekart snapshot --report-id <id> --out ./snap.png` uses it automatically. Pass `--remote-only` to force server-side rendering.
 
-```bash
-dekart snapshot-local uninstall --purge
-```
+## Links
 
-## Local release hook (main branch)
-
-Install repo hooks:
-
-```bash
-./scripts/install_hooks.sh
-```
-
-On `main`, pre-push will:
-
-1. Bump minor version in `pyproject.toml` and commit it.
-2. Build and publish to PyPI with `twine`.
-3. Stop the first push intentionally.
-
-Then run push again:
-
-```bash
-git push origin HEAD
-git push origin HEAD
-```
-
-Auth:
-- If `PYPI_API_TOKEN` is set, hook uses token auth.
-- Otherwise it uses local Twine auth (`~/.pypirc`, keyring, or prompt).
+- Dekart: [dekart.xyz](https://dekart.xyz)
+- geosql skill: [github.com/dekart-xyz/geosql](https://github.com/dekart-xyz/geosql)

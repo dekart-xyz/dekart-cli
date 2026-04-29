@@ -76,3 +76,28 @@ Optional full browser cleanup on uninstall:
 ```bash
 dekart snapshot-local uninstall --purge
 ```
+
+## Local release hook (main branch)
+
+Install repo hooks:
+
+```bash
+./scripts/install_hooks.sh
+```
+
+On `main`, pre-push will:
+
+1. Bump minor version in `pyproject.toml` and commit it.
+2. Build and publish to PyPI with `twine`.
+3. Stop the first push intentionally.
+
+Then run push again:
+
+```bash
+git push origin HEAD
+git push origin HEAD
+```
+
+Auth:
+- If `PYPI_API_TOKEN` is set, hook uses token auth.
+- Otherwise it uses local Twine auth (`~/.pypirc`, keyring, or prompt).

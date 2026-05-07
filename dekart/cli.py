@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from importlib import metadata
 import urllib.error
 import urllib.request
 import webbrowser
@@ -17,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 
 DEFAULT_DEKART_URL = "https://cloud.dekart.xyz"
 LOCALHOST_DEKART_URL = "http://localhost:8080"
+DEFAULT_VERSION_CHECK_URL = "https://cloud.dekart.xyz/api/v1/version/dekart"
 
 
 def build_parser():
@@ -276,6 +278,42 @@ def build_parser():
     )
 
     return parser
+
+
+def telemetry_disabled():
+    """Return True if telemetry/version ping is disabled by env."""
+    for key in ("DO_NOT_TRACK", "DNT"):
+        value = os.environ.get(key, "").strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
+def get_installed_version():
+    """Return installed package version or 'unknown'."""
+    try:
+        return metadata.version("dekart")
+    except metadata.PackageNotFoundError:
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def send_version_ping():
+    """Send non-blocking CLI version ping to Dekart endpoint."""
+    if telemetry_disabled():
+        return
+    url = os.environ.get("DEKART_VERSION_CHECK_URL", DEFAULT_VERSION_CHECK_URL).strip() or DEFAULT_VERSION_CHECK_URL
+    version = get_installed_version()
+    req = urllib.request.Request(url=url, method="GET")
+    req.add_header("User-Agent", f"dekart-cli/{version}")
+    try:
+        with urllib.request.urlopen(req, timeout=2):
+            return
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return
+    except Exception:
+        return
 
 
 def get_config_path():
@@ -706,8 +744,9 @@ def print_init_banner():
     ]
     for line in lines:
         print(ansi_rgb(line, 112, 181, 208, bold=True))
-    subtitle = "Interactive setup for Dekart CLI"
-    print(ansi_rgb(subtitle, 43, 50, 59))
+    version = get_installed_version()
+    subtitle = f"Interactive setup for Dekart CLI v{version}"
+    print(ansi_rgb(subtitle, 235, 235, 235, bold=True))
     print()
 
 
@@ -2180,6 +2219,7 @@ def handle_init(no_browser, local_snapshot_mode):
 
 def main():
     """CLI entrypoint."""
+    send_version_ping()
     parser = build_parser()
     args = parser.parse_args()
 

@@ -50,6 +50,19 @@ dekart snapshot-local uninstall --purge  # also remove its browser cache
 
 When local snapshot is enabled, `dekart snapshot --report-id <id> --out ./snap.png` uses it automatically. Pass `--remote-only` to force server-side rendering.
 
+## Download Query Result By Job ID
+
+Fetch result bytes for a finished job:
+
+```bash
+dekart fetch-job --job-id <job-id> --wait
+```
+
+Notes:
+- By default, dataset id is resolved from `check_job_status.query_job.dataset_id`.
+- Output path defaults to `job-<job-id>.<extension>`.
+- Extension is resolved from `check_job_status` (`csv` or `parquet`).
+
 ## Links
 
 - Dekart: [dekart.xyz](https://dekart.xyz)

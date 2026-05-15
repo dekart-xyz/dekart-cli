@@ -277,6 +277,38 @@ def build_parser():
         help="Print snapshot diagnostics.",
     )
 
+    fetch_job = subparsers.add_parser(
+        "fetch-job",
+        help="Download query result file by job id.",
+    )
+    fetch_job.add_argument("--job-id", required=True, help="Dekart query job id.")
+    fetch_job.add_argument(
+        "--out",
+        help="Output file path. Defaults to job-<job-id>.<extension>.",
+    )
+    fetch_job.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait until job reaches terminal DONE status before downloading.",
+    )
+    fetch_job.add_argument(
+        "--timeout",
+        type=int,
+        default=180,
+        help="Timeout seconds when --wait is set (default: 180).",
+    )
+    fetch_job.add_argument(
+        "--interval",
+        type=int,
+        default=2,
+        help="Polling interval seconds when --wait is set (default: 2).",
+    )
+    fetch_job.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON metadata after download.",
+    )
+
     return parser
 
 
@@ -2050,6 +2082,110 @@ def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_jso
     return 0
 
 
+def fetch_query_job(job_id_value, timeout_seconds=30):
+    """Fetch one query job via MCP check_job_status."""
+    payload = mcp_call("check_job_status", {"job_id": job_id_value}, timeout_seconds=timeout_seconds)
+    result = payload.get("result", {}) if isinstance(payload, dict) else {}
+    query_job = result.get("query_job") if isinstance(result, dict) else None
+    if not isinstance(query_job, dict):
+        raise ValueError("check_job_status returned invalid query_job payload.")
+    return query_job
+
+
+def resolve_job_result_extension(query_job):
+    """Resolve output extension from query job payload."""
+    extension = str(query_job.get("result_extension", "")).strip().lower()
+    if extension not in {"csv", "parquet"}:
+        extension = "csv"
+    return extension
+
+
+def is_terminal_done_status(query_job):
+    """Return True when job status indicates results are ready for download."""
+    status = str(query_job.get("job_status", "")).strip().upper()
+    return status == "JOB_STATUS_DONE"
+
+
+def handle_fetch_job(job_id, out, wait, timeout, interval, raw_json):
+    """Download query result file from job status metadata."""
+    job_id_value = str(job_id or "").strip()
+    if not job_id_value:
+        print("Invalid --job-id.", file=sys.stderr)
+        return 2
+
+    timeout_seconds = parse_int(timeout, 180)
+    interval_seconds = parse_int(interval, 2)
+    if timeout_seconds <= 0:
+        print("Invalid --timeout: must be positive.", file=sys.stderr)
+        return 2
+    if interval_seconds <= 0:
+        print("Invalid --interval: must be positive.", file=sys.stderr)
+        return 2
+
+    started = time.time()
+    try:
+        while True:
+            query_job = fetch_query_job(job_id_value, timeout_seconds=30)
+            if not wait or is_terminal_done_status(query_job):
+                break
+            if (time.time() - started) >= timeout_seconds:
+                print("Timed out waiting for job completion.", file=sys.stderr)
+                return 1
+            time.sleep(interval_seconds)
+
+        status = str(query_job.get("job_status", "")).strip()
+        if wait and not is_terminal_done_status(query_job):
+            print(f"Job is not done: {status}", file=sys.stderr)
+            return 1
+
+        source_id = str(query_job.get("job_result_id", "")).strip() or job_id_value
+        dataset_ref = str(query_job.get("dataset_id", "")).strip()
+        if not dataset_ref:
+            print("Could not resolve dataset id from job.", file=sys.stderr)
+            return 1
+
+        extension = resolve_job_result_extension(query_job)
+        dekart_url = get_dekart_url().rstrip("/")
+        source_url = f"{dekart_url}/api/v1/dataset-source/{dataset_ref}/{source_id}.{extension}"
+        body = download_binary(source_url, timeout_seconds=60)
+        output_path = Path(out or f"job-{job_id_value}.{extension}").expanduser()
+        saved = save_binary_file(output_path, body)
+
+        payload = {
+            "job_id": job_id_value,
+            "status": status,
+            "query_id": str(query_job.get("query_id", "")).strip(),
+            "job_result_id": source_id,
+            "dataset_ref": dataset_ref,
+            "result_extension": extension,
+            "path": str(saved),
+            "bytes": len(body),
+        }
+        if raw_json:
+            pretty_print_json(payload)
+        else:
+            print(f"Saved: {saved}")
+            print(f"Bytes: {len(body)}")
+        return 0
+    except ValueError as exc:
+        print(f"Invalid response: {exc}", file=sys.stderr)
+        return 1
+    except urllib.error.HTTPError as exc:
+        print(f"Download failed ({exc.code}): {exc.reason}", file=sys.stderr)
+        raw_body, parsed_body = parse_http_error_body(exc)
+        fields = extract_structured_error_fields(parsed_body)
+        for key in ("error", "message", "path", "hint"):
+            value = fields.get(key, "").strip()
+            if value:
+                print(f"{key}: {value}", file=sys.stderr)
+        if raw_body and not fields:
+            print(f"response: {raw_body}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"Download failed: {exc}", file=sys.stderr)
+        return 1
+
+
 def build_device_name():
     """Build local device label for Dekart authorization records."""
     node_name = platform.node().strip() or "unknown-host"
@@ -2292,6 +2428,17 @@ def main():
                 remote_only=args.remote_only,
                 raw_json=args.json,
                 debug=args.debug,
+            )
+        )
+    if args.command == "fetch-job":
+        raise SystemExit(
+            handle_fetch_job(
+                job_id=args.job_id,
+                out=args.out,
+                wait=args.wait,
+                timeout=args.timeout,
+                interval=args.interval,
+                raw_json=args.json,
             )
         )
 

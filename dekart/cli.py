@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 DEFAULT_DEKART_URL = "https://cloud.dekart.xyz"
 LOCALHOST_DEKART_URL = "http://localhost:8080"
@@ -442,6 +442,15 @@ def get_dekart_url():
     config = load_config(config_path)
     configured_url = config.get("dekart_url", "").strip()
     return configured_url or DEFAULT_DEKART_URL
+
+
+def resolve_dekart_url_reference(value, dekart_url=None):
+    """Resolve a URL reference returned by Dekart against the configured base URL."""
+    url_reference = str(value or "").strip()
+    if not url_reference:
+        return ""
+    base_url = str(dekart_url or get_dekart_url()).strip().rstrip("/") + "/"
+    return urljoin(base_url, url_reference)
 
 
 def get_token_path():
@@ -1997,8 +2006,8 @@ def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_jso
         print("Invalid snapshot response payload.", file=sys.stderr)
         return 1
 
-    snapshot_url = str(result.get("snapshot_url", "")).strip()
-    snapshot_render_url = str(result.get("snapshot_render_url", "")).strip()
+    snapshot_url = resolve_dekart_url_reference(result.get("snapshot_url", ""))
+    snapshot_render_url = resolve_dekart_url_reference(result.get("snapshot_render_url", ""))
     expires_in = parse_int(result.get("expires_in"), 0)
     config = load_config(get_config_path())
     settings = get_local_snapshot_settings(config)
@@ -2222,7 +2231,7 @@ def handle_init(no_browser, local_snapshot_mode):
         return 1
 
     device_id = str(start_payload.get("device_id", "")).strip()
-    auth_url = str(start_payload.get("auth_url", "")).strip()
+    auth_url = resolve_dekart_url_reference(start_payload.get("auth_url", ""), dekart_url=dekart_url)
     expires_in = int(start_payload.get("expires_in", 0) or 0)
     interval = int(start_payload.get("interval", 3) or 3)
     interval = max(interval, 1)
@@ -2256,6 +2265,9 @@ def handle_init(no_browser, local_snapshot_mode):
     while time.monotonic() <= deadline:
         try:
             token_payload = post_json(token_endpoint, {"device_id": device_id}, timeout_seconds=max(interval + 5, 10))
+        except KeyboardInterrupt:
+            print("\nAuthorization cancelled.", file=sys.stderr)
+            return 130
         except urllib.error.HTTPError as exc:
             print(f"Token polling failed ({exc.code}): {exc.reason}", file=sys.stderr)
             return 1
@@ -2347,7 +2359,11 @@ def handle_init(no_browser, local_snapshot_mode):
             print(f"Authorization failed: {error}", file=sys.stderr)
             return 1
 
-        time.sleep(interval)
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\nAuthorization cancelled.", file=sys.stderr)
+            return 130
 
     print("Authorization timed out. Run dekart init again.", file=sys.stderr)
     return 1

@@ -40,10 +40,31 @@ class NormalizeMCPCallResponseTest(unittest.TestCase):
 
         self.assertEqual(normalized["result"]["report_url"], "https://maps.example.com/reports/report-1")
 
-    def test_does_not_add_report_url_without_report_path(self):
+    def test_adds_report_url_from_nested_report_id(self):
         payload = {"result": {"report": {"id": "report-1"}}}
 
         normalized = cli.normalize_mcp_call_response("create_report", payload, "http://localhost:8080")
+
+        self.assertEqual(normalized["result"]["report_url"], "http://localhost:8080/reports/report-1")
+
+    def test_adds_report_url_for_get_report_properties(self):
+        payload = {"result": {"datasets": [], "queries": [], "report": {"id": "report-1"}}}
+
+        normalized = cli.normalize_mcp_call_response("get_report_properties", payload, "http://localhost:8080")
+
+        self.assertEqual(normalized["result"]["report_url"], "http://localhost:8080/reports/report-1")
+
+    def test_nested_report_path_wins_over_id_fallback(self):
+        payload = {"result": {"report": {"id": "report-1", "report_path": "/reports/canonical"}}}
+
+        normalized = cli.normalize_mcp_call_response("get_report_properties", payload, "http://localhost:8080")
+
+        self.assertEqual(normalized["result"]["report_url"], "http://localhost:8080/reports/canonical")
+
+    def test_does_not_add_report_url_without_report_identity(self):
+        payload = {"result": {"queries": []}}
+
+        normalized = cli.normalize_mcp_call_response("get_query", payload, "http://localhost:8080")
 
         self.assertNotIn("report_url", normalized["result"])
 
@@ -71,10 +92,10 @@ class MCPCallURLTest(unittest.TestCase):
     @mock.patch.object(
         cli.urllib.request,
         "urlopen",
-        return_value=FakeResponse({"result": {"report_path": "/reports/report-1"}}),
+        return_value=FakeResponse({"result": {"report": {"id": "report-1"}}}),
     )
-    def test_create_report_returns_absolute_url(self, _urlopen, _get_dekart_url, _get_auth_headers):
-        payload = cli.mcp_call("create_report", {})
+    def test_get_report_properties_returns_absolute_url(self, _urlopen, _get_dekart_url, _get_auth_headers):
+        payload = cli.mcp_call("get_report_properties", {"report_id": "report-1"})
 
         self.assertEqual(payload["result"]["report_url"], "http://localhost:8080/reports/report-1")
 

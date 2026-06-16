@@ -10,6 +10,9 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.8"
 authors = [{name = "Dekart XYZ"}]
+dependencies = [
+  "duckdb>=1.0.0",
+]
 
 [project.scripts]
 dekart = "dekart.cli:main"

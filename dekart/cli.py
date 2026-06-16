@@ -453,6 +453,19 @@ def resolve_dekart_url_reference(value, dekart_url=None):
     return urljoin(base_url, url_reference)
 
 
+def normalize_mcp_call_response(_name, payload, dekart_url):
+    """Add a usable report URL to MCP responses when Dekart returns only a report path."""
+    if not isinstance(payload, dict):
+        return payload
+    result = payload.get("result")
+    if not isinstance(result, dict) or str(result.get("report_url", "")).strip():
+        return payload
+    report_path = str(result.get("report_path", "")).strip()
+    if report_path:
+        result["report_url"] = resolve_dekart_url_reference(report_path, dekart_url=dekart_url)
+    return payload
+
+
 def get_token_path():
     """Return token storage path for Dekart CLI auth."""
     config_path = get_config_path()
@@ -1179,6 +1192,7 @@ def mcp_call(name, args, timeout_seconds=30, return_metadata=False):
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         body = response.read().decode("utf-8")
         payload = json.loads(body) if body.strip() else {}
+        payload = normalize_mcp_call_response(name, payload, dekart_url)
         if not return_metadata:
             return payload
         return payload, {

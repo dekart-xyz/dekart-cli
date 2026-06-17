@@ -55,23 +55,21 @@ When local snapshot is enabled, `dekart snapshot --report-id <id> --out ./snap.p
 Run a warehouse query through a Dekart connection, wait for the job, and save result rows:
 
 ```bash
-dekart query --connection-id <id> --sql-file ./query.sql --out ./result.parquet --wait --print
+dekart query --report-id <report-id> --dataset-id <dataset-id> --connection-id <id> --sql-file ./query.sql --out-dir ./results --wait --json
 ```
 
-Queries wait by default; use `--no-wait` only when you expect an already-finished job. Use `--json` instead of `--print` to return `report_id`, `dataset_id`, `query_id`, `job_id`, terminal status, `report_url`, and saved file metadata as JSON. Printing parquet rows uses the bundled DuckDB Python dependency. Empty downloads fail with `empty result (metadata/SHOW statement?)`.
+Queries wait by default; use `--no-wait` only when you expect an already-finished job. `dekart query` reuses the given report and dataset: it updates the existing dataset query when one is present, otherwise it creates one query for that dataset. Use `--json` to return `report_id`, `dataset_id`, `query_id`, `job_id`, terminal status, `report_url`, and `result_file` metadata. Empty downloads fail with `empty result (metadata/SHOW statement?)`.
 
-## Download Query Result By Job ID
+## Preview Downloaded Rows
 
-Fetch result bytes for a finished job:
+Preview a CSV or parquet file produced by `dekart query`:
 
 ```bash
-dekart fetch-job --job-id <job-id> --wait
+dekart preview ./results/<result-file>.parquet --limit 20
+dekart preview ./results/<result-file>.parquet --schema
 ```
 
-Notes:
-- By default, dataset id is resolved from `check_job_status.query_job.dataset_id`.
-- Output path defaults to `job-<job-id>.<extension>`.
-- Extension is resolved from `check_job_status` (`csv` or `parquet`).
+Preview output is tab-separated. Parquet and CSV previewing use the bundled DuckDB Python dependency.
 
 ## Links
 

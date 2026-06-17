@@ -277,50 +277,20 @@ def build_parser():
         help="Print snapshot diagnostics.",
     )
 
-    fetch_job = subparsers.add_parser(
-        "fetch-job",
-        help="Download query result file by job id.",
-    )
-    fetch_job.add_argument("--job-id", required=True, help="Dekart query job id.")
-    fetch_job.add_argument(
-        "--out",
-        help="Output file path. Defaults to job-<job-id>.<extension>.",
-    )
-    fetch_job.add_argument(
-        "--wait",
-        action="store_true",
-        help="Wait until job reaches terminal DONE status before downloading.",
-    )
-    fetch_job.add_argument(
-        "--timeout",
-        type=int,
-        default=180,
-        help="Timeout seconds when --wait is set (default: 180).",
-    )
-    fetch_job.add_argument(
-        "--interval",
-        type=int,
-        default=2,
-        help="Polling interval seconds when --wait is set (default: 2).",
-    )
-    fetch_job.add_argument(
-        "--json",
-        action="store_true",
-        help="Print JSON metadata after download.",
-    )
-
     query = subparsers.add_parser(
         "query",
         help="Run a Dekart warehouse query end-to-end and download result rows.",
     )
+    query.add_argument("--report-id", help="Existing Dekart report id to reuse.")
+    query.add_argument("--dataset-id", help="Existing Dekart dataset id to update.")
     query.add_argument("--connection-id", required=True, help="Dekart warehouse connection id.")
     query.add_argument("--sql-file", help="Path to SQL file. Preferred for real queries.")
     query.add_argument("--sql", help="Inline SQL string. Use --sql-file when possible.")
     query.add_argument(
-        "--out",
-        required=True,
-        help="Output result file path, usually result.parquet.",
+        "--out-dir",
+        help="Directory for downloaded result file. Filename is resolved from job metadata.",
     )
+    query.add_argument("--out", dest="deprecated_out", help=argparse.SUPPRESS)
     query.add_argument(
         "--wait",
         dest="wait",
@@ -356,6 +326,23 @@ def build_parser():
         "--json",
         action="store_true",
         help="Print JSON metadata.",
+    )
+
+    preview = subparsers.add_parser(
+        "preview",
+        help="Preview a downloaded Dekart result file.",
+    )
+    preview.add_argument("file", help="Downloaded parquet or CSV result file.")
+    preview.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum rows to print (default: 20).",
+    )
+    preview.add_argument(
+        "--schema",
+        action="store_true",
+        help="Print column names and types instead of rows.",
     )
 
     return parser
@@ -2258,69 +2245,6 @@ def download_query_job_result(job_id_value, query_job, out, timeout_seconds=60):
     }
 
 
-def handle_fetch_job(job_id, out, wait, timeout, interval, raw_json):
-    """Download query result file from job status metadata."""
-    job_id_value = str(job_id or "").strip()
-    if not job_id_value:
-        print("Invalid --job-id.", file=sys.stderr)
-        return 2
-
-    timeout_seconds = parse_int(timeout, 180)
-    interval_seconds = parse_int(interval, 2)
-    if timeout_seconds <= 0:
-        print("Invalid --timeout: must be positive.", file=sys.stderr)
-        return 2
-    if interval_seconds <= 0:
-        print("Invalid --interval: must be positive.", file=sys.stderr)
-        return 2
-
-    try:
-        query_job = wait_for_query_job(job_id_value, wait, timeout_seconds, interval_seconds)
-
-        status = str(query_job.get("job_status", "")).strip()
-        if wait and not is_terminal_done_status(query_job):
-            print(f"Job is not done: {status}", file=sys.stderr)
-            return 1
-
-        download = download_query_job_result(job_id_value, query_job, out, timeout_seconds=60)
-
-        payload = {
-            "job_id": job_id_value,
-            "status": status,
-            "query_id": str(query_job.get("query_id", "")).strip(),
-            **download,
-        }
-        if raw_json:
-            pretty_print_json(payload)
-        else:
-            print(f"Saved: {download['path']}")
-            print(f"Bytes: {download['bytes']}")
-        return 0
-    except TimeoutError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-    except RuntimeError as exc:
-        print(f"Query job failed: {exc}", file=sys.stderr)
-        return 1
-    except ValueError as exc:
-        print(f"Invalid response: {exc}", file=sys.stderr)
-        return 1
-    except urllib.error.HTTPError as exc:
-        print(f"Download failed ({exc.code}): {exc.reason}", file=sys.stderr)
-        raw_body, parsed_body = parse_http_error_body(exc)
-        fields = extract_structured_error_fields(parsed_body)
-        for key in ("error", "message", "path", "hint"):
-            value = fields.get(key, "").strip()
-            if value:
-                print(f"{key}: {value}", file=sys.stderr)
-        if raw_body and not fields:
-            print(f"response: {raw_body}", file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"Download failed: {exc}", file=sys.stderr)
-        return 1
-
-
 def resolve_query_sql_source(sql_file, sql):
     """Resolve SQL text from --sql-file or --sql."""
     file_value = str(sql_file or "").strip()
@@ -2356,35 +2280,121 @@ def required_nested_scalar(payload, paths, label):
     raise ValueError(f"Could not resolve {label}.")
 
 
-def run_dekart_query_control_plane(connection_id_value, sql_text, timeout_seconds):
-    """Create Dekart report/dataset/query, run SQL, and return workflow metadata."""
-    report_payload = mcp_call("create_report", {}, timeout_seconds=timeout_seconds)
-    report_result = mcp_result_object(report_payload, "create_report")
-    report_id = required_nested_scalar(
-        report_payload,
-        ("result.report.id", "result.report_id", "result.id"),
-        "report id",
+def nested_scalar(value, path):
+    """Return a non-empty scalar from a dotted path inside a nested dict."""
+    current = value
+    for key in path.split("."):
+        if not isinstance(current, dict):
+            return ""
+        current = current.get(key)
+    if isinstance(current, (str, int, float)):
+        return str(current).strip()
+    return ""
+
+
+def query_belongs_to_dataset(query, dataset_id_value):
+    """Return True when a query object appears to belong to a dataset."""
+    if not isinstance(query, dict):
+        return False
+    candidates = (
+        query.get("dataset_id"),
+        query.get("datasetId"),
+        nested_scalar(query, "dataset.id"),
+        nested_scalar(query, "dataset.dataset_id"),
     )
+    return any(str(candidate or "").strip() == dataset_id_value for candidate in candidates)
+
+
+def query_identity(query):
+    """Return a query id from common MCP response shapes."""
+    if not isinstance(query, dict):
+        return ""
+    candidates = (
+        query.get("query_id"),
+        query.get("queryId"),
+        query.get("id"),
+        nested_scalar(query, "query.id"),
+        nested_scalar(query, "query.query_id"),
+    )
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def existing_dataset_query_id(report_result, dataset_id_value):
+    """Find an existing query id for a dataset in get_report_properties output."""
+    query_groups = []
+    if isinstance(report_result, dict):
+        query_groups.append(report_result.get("queries"))
+        dataset_items = report_result.get("datasets")
+        if isinstance(dataset_items, list):
+            saw_target_dataset = False
+            for dataset in dataset_items:
+                if not isinstance(dataset, dict):
+                    continue
+                dataset_id = str(
+                    dataset.get("id")
+                    or dataset.get("dataset_id")
+                    or nested_scalar(dataset, "dataset.id")
+                    or ""
+                ).strip()
+                if dataset_id == dataset_id_value:
+                    saw_target_dataset = True
+                    query_id = str(dataset.get("query_id") or dataset.get("queryId") or "").strip()
+                    if query_id:
+                        return query_id
+                    query_groups.append(dataset.get("queries"))
+            if not saw_target_dataset:
+                raise ValueError(f"Dataset {dataset_id_value} was not found in report properties.")
+
+    for queries in query_groups:
+        if not isinstance(queries, list):
+            continue
+        for query in queries:
+            if query_belongs_to_dataset(query, dataset_id_value):
+                query_id = query_identity(query)
+                if query_id:
+                    return query_id
+    return ""
+
+
+def result_file_path(out_dir, job_id_value, query_job):
+    """Build the final result file path from resolved job metadata."""
+    directory = Path(out_dir).expanduser()
+    source_id = str(query_job.get("job_result_id", "")).strip() or job_id_value
+    dataset_ref = str(query_job.get("dataset_id", "")).strip()
+    stem = source_id or dataset_ref
+    if not stem:
+        raise ValueError("Could not resolve result file name from job.")
+    extension = resolve_job_result_extension(query_job)
+    return directory / f"{stem}.{extension}"
+
+
+def run_dekart_query_control_plane(report_id_value, dataset_id_value, connection_id_value, sql_text, timeout_seconds):
+    """Update an existing report dataset query, run SQL, and return workflow metadata."""
+    report_payload = mcp_call(
+        "get_report_properties",
+        {"report_id": report_id_value},
+        timeout_seconds=timeout_seconds,
+    )
+    report_result = mcp_result_object(report_payload, "get_report_properties")
     report_url = str(report_result.get("report_url", "")).strip()
     report_path = str(report_result.get("report_path", "")).strip()
 
-    dataset_payload = mcp_call("create_dataset", {"report_id": report_id}, timeout_seconds=timeout_seconds)
-    dataset_id = required_nested_scalar(
-        dataset_payload,
-        ("result.id", "result.dataset_id", "result.dataset.id"),
-        "dataset id",
-    )
-
-    query_payload = mcp_call(
-        "create_query",
-        {"dataset_id": dataset_id, "connection_id": connection_id_value},
-        timeout_seconds=timeout_seconds,
-    )
-    query_id = required_nested_scalar(
-        query_payload,
-        ("result.query_id", "result.query.id", "result.id"),
-        "query id",
-    )
+    query_id = existing_dataset_query_id(report_result, dataset_id_value)
+    if not query_id:
+        query_payload = mcp_call(
+            "create_query",
+            {"dataset_id": dataset_id_value, "connection_id": connection_id_value},
+            timeout_seconds=timeout_seconds,
+        )
+        query_id = required_nested_scalar(
+            query_payload,
+            ("result.query_id", "result.query.id", "result.id"),
+            "query id",
+        )
 
     mcp_call(
         "update_query",
@@ -2399,8 +2409,8 @@ def run_dekart_query_control_plane(connection_id_value, sql_text, timeout_second
     )
 
     return {
-        "report_id": report_id,
-        "dataset_id": dataset_id,
+        "report_id": report_id_value,
+        "dataset_id": dataset_id_value,
         "query_id": query_id,
         "job_id": job_id,
         "report_url": report_url,
@@ -2441,14 +2451,107 @@ def print_query_rows(path, extension):
         raise RuntimeError(f"Failed to print parquet rows with duckdb: {exc}") from exc
 
 
-def handle_query(connection_id, sql_file, sql, out, wait, timeout, interval, print_rows, raw_json):
+def validate_preview_file(path):
+    """Resolve and validate a local preview file."""
+    result_path = Path(path).expanduser()
+    if not result_path.exists():
+        raise ValueError(f"File does not exist: {result_path}")
+    if not result_path.is_file():
+        raise ValueError(f"Not a file: {result_path}")
+    if result_path.stat().st_size <= 0:
+        raise ValueError(f"File is empty: {result_path}")
+    extension = result_path.suffix.lstrip(".").lower()
+    if extension not in {"csv", "parquet"}:
+        raise ValueError("Unsupported preview format; expected .csv or .parquet.")
+    return result_path, extension
+
+
+def duckdb_relation_for_file(connection, path, extension):
+    """Return a DuckDB relation over a supported result file."""
+    if extension == "parquet":
+        return connection.execute("SELECT * FROM read_parquet(?)", [str(path)])
+    if extension == "csv":
+        return connection.execute("SELECT * FROM read_csv_auto(?)", [str(path)])
+    raise ValueError("Unsupported preview format; expected .csv or .parquet.")
+
+
+def print_preview(path, limit, schema):
+    """Print schema or rows for a downloaded CSV/parquet result."""
+    result_path, extension = validate_preview_file(path)
+    limit_value = parse_int(limit, 20)
+    if limit_value < 0:
+        raise ValueError("--limit must be zero or positive.")
+    try:
+        import duckdb  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("Cannot preview rows because the duckdb Python package is not installed.") from exc
+
+    try:
+        connection = duckdb.connect()
+        try:
+            if schema:
+                if extension == "parquet":
+                    cursor = connection.execute("DESCRIBE SELECT * FROM read_parquet(?)", [str(result_path)])
+                else:
+                    cursor = connection.execute("DESCRIBE SELECT * FROM read_csv_auto(?)", [str(result_path)])
+                for row in cursor.fetchall():
+                    print(f"{row[0]}\t{row[1]}")
+                return
+
+            cursor = duckdb_relation_for_file(connection, result_path, extension)
+            columns = [str(item[0]) for item in (cursor.description or [])]
+            if columns:
+                print("\t".join(columns))
+            remaining = limit_value
+            while remaining > 0:
+                rows = cursor.fetchmany(min(remaining, 1000))
+                if not rows:
+                    break
+                remaining -= len(rows)
+                for row in rows:
+                    print("\t".join("" if value is None else str(value) for value in row))
+        finally:
+            connection.close()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to preview result file with duckdb: {exc}") from exc
+
+
+def handle_preview(file_path, limit, schema):
+    """Preview a downloaded result file."""
+    try:
+        print_preview(file_path, limit, schema)
+        return 0
+    except ValueError as exc:
+        print(f"Invalid preview arguments: {exc}", file=sys.stderr)
+        return 2
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def handle_query(report_id, dataset_id, connection_id, sql_file, sql, out_dir, deprecated_out, wait, timeout, interval, print_rows, raw_json):
     """Run a warehouse query through Dekart and download result rows."""
     if print_rows and raw_json:
         print("Use either --print or --json, not both.", file=sys.stderr)
         return 2
+    if str(deprecated_out or "").strip():
+        print("Invalid query arguments: --out was removed; use --out-dir instead.", file=sys.stderr)
+        return 2
+    report_id_value = str(report_id or "").strip()
+    if not report_id_value:
+        print("Invalid --report-id.", file=sys.stderr)
+        return 2
+    dataset_id_value = str(dataset_id or "").strip()
+    if not dataset_id_value:
+        print("Invalid --dataset-id.", file=sys.stderr)
+        return 2
     connection_id_value = str(connection_id or "").strip()
     if not connection_id_value:
         print("Invalid --connection-id.", file=sys.stderr)
+        return 2
+    out_dir_value = str(out_dir or "").strip()
+    if not out_dir_value:
+        print("Invalid query arguments: provide --out-dir.", file=sys.stderr)
         return 2
     timeout_seconds = parse_int(timeout, 300)
     interval_seconds = parse_int(interval, 5)
@@ -2472,13 +2575,20 @@ def handle_query(connection_id, sql_file, sql, out, wait, timeout, interval, pri
         return 2
 
     try:
-        metadata = run_dekart_query_control_plane(connection_id_value, sql_text, timeout_seconds=timeout_seconds)
+        metadata = run_dekart_query_control_plane(
+            report_id_value,
+            dataset_id_value,
+            connection_id_value,
+            sql_text,
+            timeout_seconds=timeout_seconds,
+        )
         query_job = wait_for_query_job(metadata["job_id"], wait, timeout_seconds, interval_seconds)
         if not is_terminal_done_status(query_job):
             status = str(query_job.get("job_status", "")).strip()
             print(f"Job is not done: {status}", file=sys.stderr)
             return 1
-        download = download_query_job_result(metadata["job_id"], query_job, out, timeout_seconds=60)
+        out_path = result_file_path(out_dir_value, metadata["job_id"], query_job)
+        download = download_query_job_result(metadata["job_id"], query_job, out_path, timeout_seconds=60)
         if parse_int(download.get("bytes"), 0) <= 0:
             print("empty result (metadata/SHOW statement?)", file=sys.stderr)
             return 1
@@ -2490,6 +2600,7 @@ def handle_query(connection_id, sql_file, sql, out, wait, timeout, interval, pri
             "job_result_id": download["job_result_id"],
             "dataset_ref": download["dataset_ref"],
             "result_extension": download["result_extension"],
+            "result_file": download["path"],
             "path": download["path"],
             "bytes": download["bytes"],
         }
@@ -2781,24 +2892,16 @@ def main():
                 debug=args.debug,
             )
         )
-    if args.command == "fetch-job":
-        raise SystemExit(
-            handle_fetch_job(
-                job_id=args.job_id,
-                out=args.out,
-                wait=args.wait,
-                timeout=args.timeout,
-                interval=args.interval,
-                raw_json=args.json,
-            )
-        )
     if args.command == "query":
         raise SystemExit(
             handle_query(
+                report_id=args.report_id,
+                dataset_id=args.dataset_id,
                 connection_id=args.connection_id,
                 sql_file=args.sql_file,
                 sql=args.sql,
-                out=args.out,
+                out_dir=args.out_dir,
+                deprecated_out=args.deprecated_out,
                 wait=args.wait,
                 timeout=args.timeout,
                 interval=args.interval,
@@ -2806,6 +2909,8 @@ def main():
                 raw_json=args.json,
             )
         )
+    if args.command == "preview":
+        raise SystemExit(handle_preview(file_path=args.file, limit=args.limit, schema=args.schema))
 
     parser.print_help()
 

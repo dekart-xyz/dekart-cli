@@ -19,8 +19,7 @@ class HandleQueryTest(unittest.TestCase):
         responses = list(
             mcp_responses
             or [
-                {"result": {"report": {"id": "report-1"}}},
-                {"result": {"id": "dataset-1"}},
+                {"result": {"report": {"id": "report-1"}, "datasets": [{"id": "dataset-1"}], "queries": []}},
                 {"result": {"query_id": "query-1"}},
                 {"result": {}},
                 {"result": {"query_job": {"id": "job-1"}}},
@@ -68,9 +67,12 @@ class HandleQueryTest(unittest.TestCase):
                 stack.enter_context(redirect_stderr(stderr))
                 status = cli.handle_query(
                     connection_id=kwargs.get("connection_id", "connection-1"),
+                    report_id=kwargs.get("report_id", "report-1"),
+                    dataset_id=kwargs.get("dataset_id", "dataset-1"),
                     sql_file=kwargs.get("sql_file", str(sql_file)),
                     sql=kwargs.get("inline_sql"),
-                    out=kwargs.get("out", str(Path(directory) / "result.parquet")),
+                    out_dir=kwargs.get("out_dir", directory),
+                    deprecated_out=kwargs.get("deprecated_out"),
                     wait=kwargs.get("wait", True),
                     timeout=kwargs.get("timeout", 300),
                     interval=kwargs.get("interval", 5),
@@ -85,14 +87,15 @@ class HandleQueryTest(unittest.TestCase):
         self.assertEqual(status, 0, stderr)
         self.assertEqual(
             [name for name, _args, _timeout, _return_metadata in calls],
-            ["create_report", "create_dataset", "create_query", "update_query", "run_query"],
+            ["get_report_properties", "create_query", "update_query", "run_query"],
         )
-        self.assertEqual(calls[1][1], {"report_id": "report-1"})
-        self.assertEqual(calls[2][1], {"dataset_id": "dataset-1", "connection_id": "connection-1"})
-        self.assertEqual(calls[3][1], {"query_id": "query-1", "query_text": "SELECT 1"})
-        self.assertEqual(calls[4][1], {"query_id": "query-1"})
+        self.assertEqual(calls[0][1], {"report_id": "report-1"})
+        self.assertEqual(calls[1][1], {"dataset_id": "dataset-1", "connection_id": "connection-1"})
+        self.assertEqual(calls[2][1], {"query_id": "query-1", "query_text": "SELECT 1"})
+        self.assertEqual(calls[3][1], {"query_id": "query-1"})
         wait.assert_called_once_with("job-1", True, 300, 5)
         downloader.assert_called_once()
+        self.assertEqual(Path(downloader.call_args.args[2]).name, "result-1.parquet")
 
         payload = json.loads(stdout)
         self.assertEqual(payload["report_id"], "report-1")
@@ -102,6 +105,62 @@ class HandleQueryTest(unittest.TestCase):
         self.assertEqual(payload["terminal_status"], "JOB_STATUS_DONE")
         self.assertEqual(payload["report_url"], "https://dekart/reports/report-1")
         self.assertEqual(payload["bytes"], 10)
+        self.assertEqual(payload["result_file"], payload["path"])
+
+    def test_query_reuses_existing_dataset_query(self):
+        status, stdout, stderr, calls, _wait, _downloader = self.run_query(
+            raw_json=True,
+            mcp_responses=[
+                {
+                    "result": {
+                        "report": {"id": "report-1"},
+                        "datasets": [{"id": "dataset-1", "query_id": "query-1"}],
+                        "queries": [{"id": "query-1"}],
+                    }
+                },
+                {"result": {}},
+                {"result": {"query_job": {"id": "job-1"}}},
+            ],
+        )
+
+        self.assertEqual(status, 0, stderr)
+        self.assertEqual(
+            [name for name, _args, _timeout, _return_metadata in calls],
+            ["get_report_properties", "update_query", "run_query"],
+        )
+        self.assertEqual(calls[1][1], {"query_id": "query-1", "query_text": "SELECT 1"})
+        self.assertEqual(json.loads(stdout)["query_id"], "query-1")
+
+    def test_query_rejects_dataset_missing_from_report(self):
+        status, stdout, stderr, calls, _wait, downloader = self.run_query(
+            raw_json=True,
+            mcp_responses=[
+                {
+                    "result": {
+                        "report": {"id": "report-1"},
+                        "datasets": [{"id": "other-dataset"}],
+                        "queries": [],
+                    }
+                },
+            ],
+        )
+
+        self.assertEqual(status, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Dataset dataset-1 was not found in report properties", stderr)
+        self.assertEqual([name for name, _args, _timeout, _return_metadata in calls], ["get_report_properties"])
+        downloader.assert_not_called()
+
+    def test_query_rejects_deprecated_out(self):
+        status, stdout, stderr, calls, _wait, _downloader = self.run_query(
+            raw_json=True,
+            deprecated_out="/tmp/result.parquet",
+        )
+
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("--out was removed; use --out-dir", stderr)
+        self.assertEqual(calls, [])
 
     def test_query_fails_fast_on_empty_result(self):
         status, stdout, stderr, _calls, _wait, _downloader = self.run_query(
@@ -239,6 +298,108 @@ class HandleQueryTest(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertEqual(stdout, "")
         self.assertIn("Use either --print or --json, not both.", stderr)
+
+
+class PreviewCommandTest(unittest.TestCase):
+    def test_preview_rejects_missing_file(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            status = cli.handle_preview("/tmp/does-not-exist.parquet", limit=20, schema=False)
+
+        self.assertEqual(status, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("File does not exist", stderr.getvalue())
+
+    def test_preview_prints_rows_with_duckdb(self):
+        class FakeCursor:
+            description = [("a",), ("b",)]
+
+            def __init__(self):
+                self.batches = [[(1, "two")], []]
+
+            def fetchmany(self, _size):
+                return self.batches.pop(0)
+
+        class FakeConnection:
+            def __init__(self):
+                self.calls = []
+                self.closed = False
+
+            def execute(self, sql, params):
+                self.calls.append((sql, params))
+                return FakeCursor()
+
+            def close(self):
+                self.closed = True
+
+        fake_connection = FakeConnection()
+        fake_duckdb = types.SimpleNamespace(connect=lambda: fake_connection)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.parquet"
+            result_path.write_bytes(b"PAR1")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.dict(sys.modules, {"duckdb": fake_duckdb}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    status = cli.handle_preview(str(result_path), limit=20, schema=False)
+
+        self.assertEqual(status, 0, stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "a\tb\n1\ttwo\n")
+        self.assertEqual(
+            fake_connection.calls,
+            [("SELECT * FROM read_parquet(?)", [str(result_path)])],
+        )
+        self.assertTrue(fake_connection.closed)
+
+    def test_preview_prints_schema_with_duckdb(self):
+        class FakeCursor:
+            def fetchall(self):
+                return [("a", "INTEGER"), ("b", "VARCHAR")]
+
+        class FakeConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, sql, params):
+                self.calls.append((sql, params))
+                return FakeCursor()
+
+            def close(self):
+                pass
+
+        fake_connection = FakeConnection()
+        fake_duckdb = types.SimpleNamespace(connect=lambda: fake_connection)
+
+        with tempfile.TemporaryDirectory() as directory:
+            result_path = Path(directory) / "result.csv"
+            result_path.write_text("a,b\n1,two\n", encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.dict(sys.modules, {"duckdb": fake_duckdb}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    status = cli.handle_preview(str(result_path), limit=20, schema=True)
+
+        self.assertEqual(status, 0, stderr.getvalue())
+        self.assertEqual(stdout.getvalue(), "a\tINTEGER\nb\tVARCHAR\n")
+        self.assertEqual(
+            fake_connection.calls,
+            [("DESCRIBE SELECT * FROM read_csv_auto(?)", [str(result_path)])],
+        )
+
+
+class ParserTest(unittest.TestCase):
+    def test_fetch_job_is_not_a_subcommand(self):
+        parser = cli.build_parser()
+        help_text = parser.format_help()
+        self.assertNotIn("fetch-job", help_text)
+
+    def test_old_query_out_flag_reaches_deprecation_handler(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["query", "--connection-id", "connection-1", "--sql", "SELECT 1", "--out", "/tmp/result.parquet"])
+        self.assertEqual(args.command, "query")
+        self.assertEqual(args.deprecated_out, "/tmp/result.parquet")
 
 
 class WaitForQueryJobTest(unittest.TestCase):

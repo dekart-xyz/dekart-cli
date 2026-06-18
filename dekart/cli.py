@@ -277,52 +277,59 @@ def build_parser():
         help="Print snapshot diagnostics.",
     )
 
-    query = subparsers.add_parser(
-        "query",
-        help="Run a Dekart warehouse query end-to-end and download result rows.",
+    report_url = subparsers.add_parser(
+        "report-url",
+        help="Resolve a user-facing Dekart report URL from a report id.",
     )
-    query.add_argument("--report-id", help="Existing Dekart report id to reuse.")
-    query.add_argument("--dataset-id", help="Existing Dekart dataset id to update.")
-    query.add_argument("--connection-id", required=True, help="Dekart warehouse connection id.")
-    query.add_argument("--sql-file", help="Path to SQL file. Preferred for real queries.")
-    query.add_argument("--sql", help="Inline SQL string. Use --sql-file when possible.")
-    query.add_argument(
+    report_url.add_argument("--report-id", required=True, help="Dekart report id.")
+    report_url.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON metadata.",
+    )
+
+    run_query = subparsers.add_parser(
+        "run-query",
+        help="Run an already-prepared Dekart query and download result rows.",
+    )
+    run_query.add_argument("--query-id", required=True, help="Prepared Dekart query id to run.")
+    run_query.add_argument(
         "--out-dir",
         help="Directory for downloaded result file. Filename is resolved from job metadata.",
     )
-    query.add_argument("--out", dest="deprecated_out", help=argparse.SUPPRESS)
-    query.add_argument(
+    run_query.add_argument("--out", dest="deprecated_out", help=argparse.SUPPRESS)
+    run_query.add_argument(
         "--wait",
         dest="wait",
         action="store_true",
         default=True,
         help="Wait until the query reaches terminal DONE status before download.",
     )
-    query.add_argument(
+    run_query.add_argument(
         "--no-wait",
         dest="wait",
         action="store_false",
         help="Do not wait; fail unless the first job status is already DONE.",
     )
-    query.add_argument(
+    run_query.add_argument(
         "--timeout",
         type=int,
         default=300,
         help="Timeout seconds when --wait is set (default: 300).",
     )
-    query.add_argument(
+    run_query.add_argument(
         "--interval",
         type=int,
         default=5,
         help="Polling interval seconds when --wait is set (default: 5).",
     )
-    query.add_argument(
+    run_query.add_argument(
         "--print",
         dest="print_rows",
         action="store_true",
         help="Print fetched result rows to stdout after download.",
     )
-    query.add_argument(
+    run_query.add_argument(
         "--json",
         action="store_true",
         help="Print JSON metadata.",
@@ -487,44 +494,6 @@ def resolve_dekart_url_reference(value, dekart_url=None):
         return ""
     base_url = str(dekart_url or get_dekart_url()).strip().rstrip("/") + "/"
     return urljoin(base_url, url_reference)
-
-
-def nested_dict(payload, key):
-    """Return a nested dict value when present."""
-    if not isinstance(payload, dict):
-        return {}
-    value = payload.get(key)
-    return value if isinstance(value, dict) else {}
-
-
-def normalize_mcp_call_response(name, payload, dekart_url):
-    """Add a usable report URL to MCP responses when Dekart returns report identity."""
-    if not isinstance(payload, dict):
-        return payload
-    result = payload.get("result")
-    if not isinstance(result, dict) or str(result.get("report_url", "")).strip():
-        return payload
-
-    report = nested_dict(result, "report")
-    report_url = str(report.get("report_url", "") or report.get("url", "")).strip()
-    if report_url:
-        result["report_url"] = resolve_dekart_url_reference(report_url, dekart_url=dekart_url)
-        return payload
-
-    report_path = str(
-        result.get("report_path", "")
-        or report.get("report_path", "")
-        or report.get("path", "")
-    ).strip()
-    if report_path:
-        result["report_url"] = resolve_dekart_url_reference(report_path, dekart_url=dekart_url)
-        return payload
-
-    tool_name = str(name or "").lower()
-    report_id = str(result.get("report_id", "") or report.get("id", "")).strip()
-    if report_id and ("report" in tool_name or report):
-        result["report_url"] = resolve_dekart_url_reference(f"reports/{quote(report_id, safe='')}", dekart_url=dekart_url)
-    return payload
 
 
 def get_token_path():
@@ -1253,7 +1222,6 @@ def mcp_call(name, args, timeout_seconds=30, return_metadata=False):
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         body = response.read().decode("utf-8")
         payload = json.loads(body) if body.strip() else {}
-        payload = normalize_mcp_call_response(name, payload, dekart_url)
         if not return_metadata:
             return payload
         return payload, {
@@ -2245,27 +2213,6 @@ def download_query_job_result(job_id_value, query_job, out, timeout_seconds=60):
     }
 
 
-def resolve_query_sql_source(sql_file, sql):
-    """Resolve SQL text from --sql-file or --sql."""
-    file_value = str(sql_file or "").strip()
-    inline_value = str(sql or "").strip()
-    if file_value and inline_value:
-        raise ValueError("Use only one source: --sql-file or --sql.")
-    if not file_value and not inline_value:
-        raise ValueError("Provide --sql-file or --sql.")
-    if file_value:
-        return Path(file_value).expanduser().read_text(encoding="utf-8")
-    return inline_value
-
-
-def mcp_result_object(payload, tool_name):
-    """Return result object from an MCP response payload."""
-    result = payload.get("result") if isinstance(payload, dict) else None
-    if not isinstance(result, dict):
-        raise ValueError(f"{tool_name} returned invalid result payload.")
-    return result
-
-
 def required_nested_scalar(payload, paths, label):
     """Return first non-empty scalar found at one of the candidate paths."""
     for path in paths:
@@ -2280,86 +2227,6 @@ def required_nested_scalar(payload, paths, label):
     raise ValueError(f"Could not resolve {label}.")
 
 
-def nested_scalar(value, path):
-    """Return a non-empty scalar from a dotted path inside a nested dict."""
-    current = value
-    for key in path.split("."):
-        if not isinstance(current, dict):
-            return ""
-        current = current.get(key)
-    if isinstance(current, (str, int, float)):
-        return str(current).strip()
-    return ""
-
-
-def query_belongs_to_dataset(query, dataset_id_value):
-    """Return True when a query object appears to belong to a dataset."""
-    if not isinstance(query, dict):
-        return False
-    candidates = (
-        query.get("dataset_id"),
-        query.get("datasetId"),
-        nested_scalar(query, "dataset.id"),
-        nested_scalar(query, "dataset.dataset_id"),
-    )
-    return any(str(candidate or "").strip() == dataset_id_value for candidate in candidates)
-
-
-def query_identity(query):
-    """Return a query id from common MCP response shapes."""
-    if not isinstance(query, dict):
-        return ""
-    candidates = (
-        query.get("query_id"),
-        query.get("queryId"),
-        query.get("id"),
-        nested_scalar(query, "query.id"),
-        nested_scalar(query, "query.query_id"),
-    )
-    for candidate in candidates:
-        value = str(candidate or "").strip()
-        if value:
-            return value
-    return ""
-
-
-def existing_dataset_query_id(report_result, dataset_id_value):
-    """Find an existing query id for a dataset in get_report_properties output."""
-    query_groups = []
-    if isinstance(report_result, dict):
-        query_groups.append(report_result.get("queries"))
-        dataset_items = report_result.get("datasets")
-        if isinstance(dataset_items, list):
-            saw_target_dataset = False
-            for dataset in dataset_items:
-                if not isinstance(dataset, dict):
-                    continue
-                dataset_id = str(
-                    dataset.get("id")
-                    or dataset.get("dataset_id")
-                    or nested_scalar(dataset, "dataset.id")
-                    or ""
-                ).strip()
-                if dataset_id == dataset_id_value:
-                    saw_target_dataset = True
-                    query_id = str(dataset.get("query_id") or dataset.get("queryId") or "").strip()
-                    if query_id:
-                        return query_id
-                    query_groups.append(dataset.get("queries"))
-            if not saw_target_dataset:
-                raise ValueError(f"Dataset {dataset_id_value} was not found in report properties.")
-
-    for queries in query_groups:
-        if not isinstance(queries, list):
-            continue
-        for query in queries:
-            if query_belongs_to_dataset(query, dataset_id_value):
-                query_id = query_identity(query)
-                if query_id:
-                    return query_id
-    return ""
-
-
 def result_file_path(out_dir, job_id_value, query_job):
     """Build the final result file path from resolved job metadata."""
     directory = Path(out_dir).expanduser()
@@ -2372,49 +2239,36 @@ def result_file_path(out_dir, job_id_value, query_job):
     return directory / f"{stem}.{extension}"
 
 
-def run_dekart_query_control_plane(report_id_value, dataset_id_value, connection_id_value, sql_text, timeout_seconds):
-    """Update an existing report dataset query, run SQL, and return workflow metadata."""
-    report_payload = mcp_call(
-        "get_report_properties",
-        {"report_id": report_id_value},
-        timeout_seconds=timeout_seconds,
-    )
-    report_result = mcp_result_object(report_payload, "get_report_properties")
-    report_url = str(report_result.get("report_url", "")).strip()
-    report_path = str(report_result.get("report_path", "")).strip()
+def report_url_for_report_id(report_id_value, dekart_url=None):
+    """Build a user-facing Dekart report URL from a report id."""
+    return resolve_dekart_url_reference(f"reports/{quote(report_id_value, safe='')}", dekart_url=dekart_url)
 
-    query_id = existing_dataset_query_id(report_result, dataset_id_value)
-    if not query_id:
-        query_payload = mcp_call(
-            "create_query",
-            {"dataset_id": dataset_id_value, "connection_id": connection_id_value},
-            timeout_seconds=timeout_seconds,
-        )
-        query_id = required_nested_scalar(
-            query_payload,
-            ("result.query_id", "result.query.id", "result.id"),
-            "query id",
-        )
 
-    mcp_call(
-        "update_query",
-        {"query_id": query_id, "query_text": sql_text},
-        timeout_seconds=timeout_seconds,
-    )
-    run_payload = mcp_call("run_query", {"query_id": query_id}, timeout_seconds=timeout_seconds)
+def handle_report_url(report_id, raw_json):
+    """Resolve a report id to a user-facing Dekart report URL."""
+    report_id_value = str(report_id or "").strip()
+    if not report_id_value:
+        print("Invalid --report-id.", file=sys.stderr)
+        return 2
+    report_url = report_url_for_report_id(report_id_value)
+    if raw_json:
+        pretty_print_json({"report_id": report_id_value, "report_url": report_url})
+    else:
+        print(report_url)
+    return 0
+
+
+def run_prepared_query(query_id_value, timeout_seconds):
+    """Run an existing query and return the new job id."""
+    run_payload = mcp_call("run_query", {"query_id": query_id_value}, timeout_seconds=timeout_seconds)
     job_id = required_nested_scalar(
         run_payload,
         ("result.query_job.id", "result.queryJob.id", "result.job_id", "result.id"),
         "job id",
     )
-
     return {
-        "report_id": report_id_value,
-        "dataset_id": dataset_id_value,
-        "query_id": query_id,
+        "query_id": query_id_value,
         "job_id": job_id,
-        "report_url": report_url,
-        "report_path": report_path,
     }
 
 
@@ -2529,29 +2383,21 @@ def handle_preview(file_path, limit, schema):
         return 1
 
 
-def handle_query(report_id, dataset_id, connection_id, sql_file, sql, out_dir, deprecated_out, wait, timeout, interval, print_rows, raw_json):
-    """Run a warehouse query through Dekart and download result rows."""
+def handle_run_query(query_id, out_dir, deprecated_out, wait, timeout, interval, print_rows, raw_json):
+    """Run a prepared query through Dekart and download result rows."""
     if print_rows and raw_json:
         print("Use either --print or --json, not both.", file=sys.stderr)
         return 2
     if str(deprecated_out or "").strip():
-        print("Invalid query arguments: --out was removed; use --out-dir instead.", file=sys.stderr)
+        print("Invalid run-query arguments: --out was removed; use --out-dir instead.", file=sys.stderr)
         return 2
-    report_id_value = str(report_id or "").strip()
-    if not report_id_value:
-        print("Invalid --report-id.", file=sys.stderr)
-        return 2
-    dataset_id_value = str(dataset_id or "").strip()
-    if not dataset_id_value:
-        print("Invalid --dataset-id.", file=sys.stderr)
-        return 2
-    connection_id_value = str(connection_id or "").strip()
-    if not connection_id_value:
-        print("Invalid --connection-id.", file=sys.stderr)
+    query_id_value = str(query_id or "").strip()
+    if not query_id_value:
+        print("Invalid --query-id.", file=sys.stderr)
         return 2
     out_dir_value = str(out_dir or "").strip()
     if not out_dir_value:
-        print("Invalid query arguments: provide --out-dir.", file=sys.stderr)
+        print("Invalid run-query arguments: provide --out-dir.", file=sys.stderr)
         return 2
     timeout_seconds = parse_int(timeout, 300)
     interval_seconds = parse_int(interval, 5)
@@ -2563,25 +2409,7 @@ def handle_query(report_id, dataset_id, connection_id, sql_file, sql, out_dir, d
         return 2
 
     try:
-        sql_text = resolve_query_sql_source(sql_file, sql)
-        if not sql_text.strip():
-            print("Invalid query arguments: SQL is empty.", file=sys.stderr)
-            return 2
-    except OSError as exc:
-        print(f"Failed to read SQL source: {exc}", file=sys.stderr)
-        return 2
-    except ValueError as exc:
-        print(f"Invalid query arguments: {exc}", file=sys.stderr)
-        return 2
-
-    try:
-        metadata = run_dekart_query_control_plane(
-            report_id_value,
-            dataset_id_value,
-            connection_id_value,
-            sql_text,
-            timeout_seconds=timeout_seconds,
-        )
+        metadata = run_prepared_query(query_id_value, timeout_seconds=timeout_seconds)
         query_job = wait_for_query_job(metadata["job_id"], wait, timeout_seconds, interval_seconds)
         if not is_terminal_done_status(query_job):
             status = str(query_job.get("job_status", "")).strip()
@@ -2596,6 +2424,7 @@ def handle_query(report_id, dataset_id, connection_id, sql_file, sql, out_dir, d
         status = str(query_job.get("job_status", "")).strip()
         payload = {
             **metadata,
+            "dataset_id": str(query_job.get("dataset_id", "")).strip(),
             "terminal_status": status,
             "job_result_id": download["job_result_id"],
             "dataset_ref": download["dataset_ref"],
@@ -2613,8 +2442,6 @@ def handle_query(report_id, dataset_id, connection_id, sql_file, sql, out_dir, d
         elif not print_rows:
             print(f"Saved: {payload['path']}")
             print(f"Bytes: {payload['bytes']}")
-            if payload.get("report_url"):
-                print(f"Report URL: {payload['report_url']}")
         return 0
     except TimeoutError as exc:
         print(str(exc), file=sys.stderr)
@@ -2892,14 +2719,12 @@ def main():
                 debug=args.debug,
             )
         )
-    if args.command == "query":
+    if args.command == "report-url":
+        raise SystemExit(handle_report_url(report_id=args.report_id, raw_json=args.json))
+    if args.command == "run-query":
         raise SystemExit(
-            handle_query(
-                report_id=args.report_id,
-                dataset_id=args.dataset_id,
-                connection_id=args.connection_id,
-                sql_file=args.sql_file,
-                sql=args.sql,
+            handle_run_query(
+                query_id=args.query_id,
                 out_dir=args.out_dir,
                 deprecated_out=args.deprecated_out,
                 wait=args.wait,

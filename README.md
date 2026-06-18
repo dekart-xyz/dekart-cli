@@ -50,19 +50,26 @@ dekart snapshot-local uninstall --purge  # also remove its browser cache
 
 When local snapshot is enabled, `dekart snapshot --report-id <id> --out ./snap.png` uses it automatically. Pass `--remote-only` to force server-side rendering.
 
-## Run Query And Download Rows
+## Run Prepared Query And Download Rows
 
-Run a warehouse query through a Dekart connection, wait for the job, and save result rows:
+Run an already-prepared Dekart query, wait for the job, and save result rows:
 
 ```bash
-dekart query --report-id <report-id> --dataset-id <dataset-id> --connection-id <id> --sql-file ./query.sql --out-dir ./results --wait --json
+dekart run-query --query-id <query-id> --out-dir ./results --wait --json
 ```
 
-Queries wait by default; use `--no-wait` only when you expect an already-finished job. `dekart query` reuses the given report and dataset: it updates the existing dataset query when one is present, otherwise it creates one query for that dataset. Use `--json` to return `report_id`, `dataset_id`, `query_id`, `job_id`, terminal status, `report_url`, and `result_file` metadata. Empty downloads fail with `empty result (metadata/SHOW statement?)`.
+Queries wait by default; use `--no-wait` only when you expect an already-finished job. Prepare the query separately with `dekart call --name create_query` and `dekart call --name update_query`, then use `dekart run-query` to run, poll, and download the result. Use `--json` to return `dataset_id`, `query_id`, `job_id`, terminal status, and `result_file` metadata. Empty downloads fail with `empty result (metadata/SHOW statement?)`.
+
+Resolve a report URL explicitly from a report id:
+
+```bash
+dekart report-url --report-id <report-id>
+dekart report-url --report-id <report-id> --json
+```
 
 ## Preview Downloaded Rows
 
-Preview a CSV or parquet file produced by `dekart query`:
+Preview a CSV or parquet file produced by `dekart run-query`:
 
 ```bash
 dekart preview ./results/<result-file>.parquet --limit 20

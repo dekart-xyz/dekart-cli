@@ -11,28 +11,23 @@ from unittest import mock
 from dekart import cli
 
 
-class HandleQueryTest(unittest.TestCase):
-    def run_query(self, *, mcp_responses=None, query_job=None, download=None, sql="SELECT 1", **kwargs):
+class HandleRunQueryTest(unittest.TestCase):
+    def run_query(self, *, mcp_responses=None, query_job=None, download=None, **kwargs):
         stdout = io.StringIO()
         stderr = io.StringIO()
         calls = []
         responses = list(
             mcp_responses
             or [
-                {"result": {"report": {"id": "report-1"}, "datasets": [{"id": "dataset-1"}], "queries": []}},
-                {"result": {"query_id": "query-1"}},
-                {"result": {}},
                 {"result": {"query_job": {"id": "job-1"}}},
             ]
         )
 
         def fake_mcp_call(name, args, timeout_seconds=30, return_metadata=False):
             calls.append((name, args, timeout_seconds, return_metadata))
-            return cli.normalize_mcp_call_response(name, responses.pop(0), "https://dekart")
+            return responses.pop(0)
 
         with tempfile.TemporaryDirectory() as directory:
-            sql_file = Path(directory) / "query.sql"
-            sql_file.write_text(sql, encoding="utf-8")
             with ExitStack() as stack:
                 stack.enter_context(mock.patch.object(cli, "mcp_call", side_effect=fake_mcp_call))
                 wait = stack.enter_context(
@@ -65,12 +60,8 @@ class HandleQueryTest(unittest.TestCase):
                 )
                 stack.enter_context(redirect_stdout(stdout))
                 stack.enter_context(redirect_stderr(stderr))
-                status = cli.handle_query(
-                    connection_id=kwargs.get("connection_id", "connection-1"),
-                    report_id=kwargs.get("report_id", "report-1"),
-                    dataset_id=kwargs.get("dataset_id", "dataset-1"),
-                    sql_file=kwargs.get("sql_file", str(sql_file)),
-                    sql=kwargs.get("inline_sql"),
+                status = cli.handle_run_query(
+                    query_id=kwargs.get("query_id", "query-1"),
                     out_dir=kwargs.get("out_dir", directory),
                     deprecated_out=kwargs.get("deprecated_out"),
                     wait=kwargs.get("wait", True),
@@ -81,77 +72,110 @@ class HandleQueryTest(unittest.TestCase):
                 )
         return status, stdout.getvalue(), stderr.getvalue(), calls, wait, downloader
 
-    def test_query_json_runs_control_plane_and_downloads_result(self):
+    def test_run_query_json_runs_prepared_query_and_downloads_result(self):
         status, stdout, stderr, calls, wait, downloader = self.run_query(raw_json=True)
 
         self.assertEqual(status, 0, stderr)
         self.assertEqual(
             [name for name, _args, _timeout, _return_metadata in calls],
-            ["get_report_properties", "create_query", "update_query", "run_query"],
+            ["run_query"],
         )
-        self.assertEqual(calls[0][1], {"report_id": "report-1"})
-        self.assertEqual(calls[1][1], {"dataset_id": "dataset-1", "connection_id": "connection-1"})
-        self.assertEqual(calls[2][1], {"query_id": "query-1", "query_text": "SELECT 1"})
-        self.assertEqual(calls[3][1], {"query_id": "query-1"})
+        self.assertEqual(calls[0][1], {"query_id": "query-1"})
         wait.assert_called_once_with("job-1", True, 300, 5)
         downloader.assert_called_once()
         self.assertEqual(Path(downloader.call_args.args[2]).name, "result-1.parquet")
 
         payload = json.loads(stdout)
-        self.assertEqual(payload["report_id"], "report-1")
         self.assertEqual(payload["dataset_id"], "dataset-1")
         self.assertEqual(payload["query_id"], "query-1")
         self.assertEqual(payload["job_id"], "job-1")
         self.assertEqual(payload["terminal_status"], "JOB_STATUS_DONE")
-        self.assertEqual(payload["report_url"], "https://dekart/reports/report-1")
         self.assertEqual(payload["bytes"], 10)
         self.assertEqual(payload["result_file"], payload["path"])
+        self.assertNotIn("report_url", payload)
+        self.assertNotIn("report_path", payload)
 
-    def test_query_reuses_existing_dataset_query(self):
-        status, stdout, stderr, calls, _wait, _downloader = self.run_query(
+    def test_run_query_json_ignores_report_url_fields_from_run_response(self):
+        status, stdout, stderr, _calls, _wait, _downloader = self.run_query(
             raw_json=True,
             mcp_responses=[
                 {
                     "result": {
-                        "report": {"id": "report-1"},
-                        "datasets": [{"id": "dataset-1", "query_id": "query-1"}],
-                        "queries": [{"id": "query-1"}],
+                        "query_job": {"id": "job-1"},
+                        "report_url": "https://dekart/reports/report-1",
+                        "report_path": "/reports/report-1",
                     }
-                },
-                {"result": {}},
+                }
+            ],
+        )
+
+        self.assertEqual(status, 0, stderr)
+        payload = json.loads(stdout)
+        self.assertNotIn("report_url", payload)
+        self.assertNotIn("report_path", payload)
+
+    def test_run_query_does_not_touch_create_or_update_control_plane(self):
+        status, stdout, stderr, calls, _wait, _downloader = self.run_query(
+            raw_json=True,
+            mcp_responses=[
                 {"result": {"query_job": {"id": "job-1"}}},
             ],
         )
 
         self.assertEqual(status, 0, stderr)
-        self.assertEqual(
-            [name for name, _args, _timeout, _return_metadata in calls],
-            ["get_report_properties", "update_query", "run_query"],
-        )
-        self.assertEqual(calls[1][1], {"query_id": "query-1", "query_text": "SELECT 1"})
+        self.assertEqual([name for name, _args, _timeout, _return_metadata in calls], ["run_query"])
+        self.assertNotIn("create_query", [name for name, _args, _timeout, _return_metadata in calls])
+        self.assertNotIn("update_query", [name for name, _args, _timeout, _return_metadata in calls])
         self.assertEqual(json.loads(stdout)["query_id"], "query-1")
 
-    def test_query_rejects_dataset_missing_from_report(self):
-        status, stdout, stderr, calls, _wait, downloader = self.run_query(
-            raw_json=True,
-            mcp_responses=[
-                {
-                    "result": {
-                        "report": {"id": "report-1"},
-                        "datasets": [{"id": "other-dataset"}],
-                        "queries": [],
+    def test_run_query_real_poll_and_download_call_sequence_is_narrow(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        calls = []
+        responses = [
+            {"result": {"query_job": {"id": "job-1"}}},
+            {
+                "result": {
+                    "query_job": {
+                        "job_status": "JOB_STATUS_DONE",
+                        "query_id": "query-1",
+                        "dataset_id": "dataset-1",
+                        "job_result_id": "result-1",
+                        "result_extension": "csv",
                     }
-                },
-            ],
-        )
+                }
+            },
+        ]
 
-        self.assertEqual(status, 1)
-        self.assertEqual(stdout, "")
-        self.assertIn("Dataset dataset-1 was not found in report properties", stderr)
-        self.assertEqual([name for name, _args, _timeout, _return_metadata in calls], ["get_report_properties"])
-        downloader.assert_not_called()
+        def fake_mcp_call(name, args, timeout_seconds=30, return_metadata=False):
+            calls.append((name, args, timeout_seconds, return_metadata))
+            return responses.pop(0)
 
-    def test_query_rejects_deprecated_out(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(cli, "mcp_call", side_effect=fake_mcp_call))
+                stack.enter_context(mock.patch.object(cli, "download_binary", return_value=b"a,b\n1,2\n"))
+                stack.enter_context(mock.patch.object(cli, "get_dekart_url", return_value="https://dekart"))
+                stack.enter_context(redirect_stdout(stdout))
+                stack.enter_context(redirect_stderr(stderr))
+                status = cli.handle_run_query(
+                    query_id="query-1",
+                    out_dir=directory,
+                    deprecated_out=None,
+                    wait=True,
+                    timeout=300,
+                    interval=5,
+                    print_rows=False,
+                    raw_json=True,
+                )
+
+        self.assertEqual(status, 0, stderr.getvalue())
+        self.assertEqual([name for name, _args, _timeout, _return_metadata in calls], ["run_query", "check_job_status"])
+        self.assertEqual(calls[0][1], {"query_id": "query-1"})
+        self.assertEqual(calls[1][1], {"job_id": "job-1"})
+        self.assertEqual(json.loads(stdout.getvalue())["result_file"], str(Path(directory) / "result-1.csv"))
+
+    def test_run_query_rejects_deprecated_out(self):
         status, stdout, stderr, calls, _wait, _downloader = self.run_query(
             raw_json=True,
             deprecated_out="/tmp/result.parquet",
@@ -162,7 +186,7 @@ class HandleQueryTest(unittest.TestCase):
         self.assertIn("--out was removed; use --out-dir", stderr)
         self.assertEqual(calls, [])
 
-    def test_query_fails_fast_on_empty_result(self):
+    def test_run_query_fails_fast_on_empty_result(self):
         status, stdout, stderr, _calls, _wait, _downloader = self.run_query(
             raw_json=True,
             download={
@@ -178,7 +202,7 @@ class HandleQueryTest(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertIn("empty result (metadata/SHOW statement?)", stderr)
 
-    def test_query_prints_csv_rows_without_metadata(self):
+    def test_run_query_prints_csv_rows_without_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             result_path = Path(directory) / "result.csv"
             result_path.write_text("a,b\n1,2\n", encoding="utf-8")
@@ -197,7 +221,7 @@ class HandleQueryTest(unittest.TestCase):
         self.assertEqual(status, 0, stderr)
         self.assertEqual(stdout, "a,b\n1,2\n")
 
-    def test_query_rejects_no_wait_when_job_is_not_done(self):
+    def test_run_query_rejects_no_wait_when_job_is_not_done(self):
         status, stdout, stderr, _calls, _wait, downloader = self.run_query(
             raw_json=True,
             wait=False,
@@ -215,7 +239,7 @@ class HandleQueryTest(unittest.TestCase):
         self.assertIn("Job is not done: JOB_STATUS_RUNNING", stderr)
         downloader.assert_not_called()
 
-    def test_query_print_parquet_requires_duckdb(self):
+    def test_run_query_print_parquet_requires_duckdb(self):
         with tempfile.TemporaryDirectory() as directory:
             result_path = Path(directory) / "result.parquet"
             result_path.write_bytes(b"PAR1")
@@ -236,7 +260,7 @@ class HandleQueryTest(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertIn("Cannot print parquet rows because the duckdb Python package is not installed", stderr)
 
-    def test_query_prints_parquet_rows_with_duckdb_python(self):
+    def test_run_query_prints_parquet_rows_with_duckdb_python(self):
         class FakeCursor:
             description = [("a",), ("b",)]
 
@@ -289,7 +313,7 @@ class HandleQueryTest(unittest.TestCase):
         )
         self.assertTrue(fake_connection.closed)
 
-    def test_query_rejects_print_and_json_together(self):
+    def test_run_query_rejects_print_and_json_together(self):
         status, stdout, stderr, _calls, _wait, _downloader = self.run_query(
             raw_json=True,
             print_rows=True,
@@ -395,10 +419,34 @@ class ParserTest(unittest.TestCase):
         help_text = parser.format_help()
         self.assertNotIn("fetch-job", help_text)
 
-    def test_old_query_out_flag_reaches_deprecation_handler(self):
+    def test_run_query_is_listed_and_query_is_not_a_subcommand(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["query", "--connection-id", "connection-1", "--sql", "SELECT 1", "--out", "/tmp/result.parquet"])
-        self.assertEqual(args.command, "query")
+        help_text = parser.format_help()
+        choices = parser._subparsers._actions[1].choices
+        self.assertIn("run-query", help_text)
+        self.assertIn("report-url", help_text)
+        self.assertIn("run-query", choices)
+        self.assertIn("report-url", choices)
+        self.assertNotIn("query", choices)
+
+    def test_run_query_parses_required_arguments(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["run-query", "--query-id", "query-1", "--out-dir", "/tmp/results", "--json"])
+        self.assertEqual(args.command, "run-query")
+        self.assertEqual(args.query_id, "query-1")
+        self.assertEqual(args.out_dir, "/tmp/results")
+        self.assertTrue(args.json)
+
+    def test_query_is_not_a_subcommand(self):
+        parser = cli.build_parser()
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["query", "--query-id", "query-1", "--out-dir", "/tmp/results"])
+
+    def test_old_run_query_out_flag_reaches_deprecation_handler(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["run-query", "--query-id", "query-1", "--out", "/tmp/result.parquet"])
+        self.assertEqual(args.command, "run-query")
         self.assertEqual(args.deprecated_out, "/tmp/result.parquet")
 
 

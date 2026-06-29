@@ -50,6 +50,14 @@ dekart snapshot-local uninstall --purge  # also remove its browser cache
 
 When local snapshot is enabled, `dekart snapshot --report-id <id> --out ./snap.png` uses it automatically. Pass `--remote-only` to force server-side rendering.
 
+Agents can request a specific snapshot viewport without editing the saved map:
+
+```bash
+dekart snapshot --report-id <id> --zoom 12 --lat 52.52 --lon 13.405 --out ./snap.png
+```
+
+`--zoom` accepts `0` through `24`. Use `--lat` and `--lon` together.
+
 ## Run Prepared Query And Download Rows
 
 Run an already-prepared Dekart query, wait for the job, and save result rows:

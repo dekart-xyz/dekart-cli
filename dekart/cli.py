@@ -1,6 +1,7 @@
 import argparse
 import datetime as dt
 import json
+import math
 import mimetypes
 import os
 import platform
@@ -260,6 +261,21 @@ def build_parser():
         type=int,
         default=900,
         help="Local render viewport height (default: 900).",
+    )
+    snapshot.add_argument(
+        "--zoom",
+        type=float,
+        help="Snapshot map zoom override (0-24).",
+    )
+    snapshot.add_argument(
+        "--lat",
+        type=float,
+        help="Snapshot map latitude override. Must be used with --lon.",
+    )
+    snapshot.add_argument(
+        "--lon",
+        type=float,
+        help="Snapshot map longitude override. Must be used with --lat.",
     )
     snapshot.add_argument(
         "--remote-only",
@@ -1094,6 +1110,21 @@ def parse_int(value, default=0):
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def parse_optional_float(value):
+    """Convert optional CLI float values while preserving omitted arguments."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_valid_finite_number(value, minimum, maximum):
+    """Return true for finite map viewport numbers inside the server-supported range."""
+    return value is not None and math.isfinite(value) and minimum <= value <= maximum
 
 
 def header_get(headers, key):
@@ -2010,7 +2041,34 @@ def save_binary_file(path, body):
     return target
 
 
-def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_json, debug):
+def build_snapshot_viewport_args(zoom=None, lat=None, lon=None):
+    """Validate optional agent-facing snapshot viewport overrides."""
+    viewport = {}
+    zoom_value = parse_optional_float(zoom)
+    lat_value = parse_optional_float(lat)
+    lon_value = parse_optional_float(lon)
+
+    if zoom is not None:
+        if not is_valid_finite_number(zoom_value, 0, 24):
+            raise ValueError("Invalid --zoom: must be between 0 and 24.")
+        viewport["zoom"] = zoom_value
+
+    has_lat = lat is not None
+    has_lon = lon is not None
+    if has_lat != has_lon:
+        raise ValueError("Invalid --lat/--lon: pass both latitude and longitude.")
+    if has_lat:
+        if not is_valid_finite_number(lat_value, -90, 90):
+            raise ValueError("Invalid --lat: must be between -90 and 90.")
+        if not is_valid_finite_number(lon_value, -180, 180):
+            raise ValueError("Invalid --lon: must be between -180 and 180.")
+        viewport["lat"] = lat_value
+        viewport["lon"] = lon_value
+
+    return viewport
+
+
+def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_json, debug, zoom=None, lat=None, lon=None):
     """Render report snapshot PNG locally when configured, else use remote endpoint."""
     timeout_seconds = parse_int(timeout, 90)
     if timeout_seconds <= 0:
@@ -2028,7 +2086,16 @@ def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_jso
         return 2
 
     try:
-        snapshot_payload = mcp_call("create_report_snapshot", {"report_id": report_id_value}, timeout_seconds=timeout_seconds)
+        snapshot_viewport = build_snapshot_viewport_args(zoom=zoom, lat=lat, lon=lon)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    snapshot_args = {"report_id": report_id_value}
+    snapshot_args.update(snapshot_viewport)
+
+    try:
+        snapshot_payload = mcp_call("create_report_snapshot", snapshot_args, timeout_seconds=timeout_seconds)
     except urllib.error.HTTPError as exc:
         print(f"Snapshot request failed ({exc.code}): {exc.reason}", file=sys.stderr)
         raw_body, parsed_body = parse_http_error_body(exc)
@@ -2119,6 +2186,7 @@ def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_jso
         "bytes": len(png_bytes),
         "snapshot_url": snapshot_url,
         "snapshot_render_url": snapshot_render_url,
+        "snapshot_viewport": snapshot_viewport,
         "expires_in": expires_in,
         "local_enabled": local_enabled,
         "local_attempted": can_attempt_local,
@@ -2717,6 +2785,9 @@ def main():
                 remote_only=args.remote_only,
                 raw_json=args.json,
                 debug=args.debug,
+                zoom=args.zoom,
+                lat=args.lat,
+                lon=args.lon,
             )
         )
     if args.command == "report-url":

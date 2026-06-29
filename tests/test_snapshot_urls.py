@@ -41,11 +41,21 @@ class ResolveDekartUrlReferenceTest(unittest.TestCase):
 
 
 class HandleSnapshotUrlTest(unittest.TestCase):
-    def run_snapshot(self, snapshot_result, *, remote_only=False, raw_json=False, debug=False):
+    def run_snapshot(
+        self,
+        snapshot_result,
+        *,
+        remote_only=False,
+        raw_json=False,
+        debug=False,
+        zoom=None,
+        lat=None,
+        lon=None,
+    ):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with ExitStack() as stack:
-            stack.enter_context(mock.patch.object(cli, "mcp_call", return_value={"result": snapshot_result}))
+            mcp_call = stack.enter_context(mock.patch.object(cli, "mcp_call", return_value={"result": snapshot_result}))
             stack.enter_context(mock.patch.object(cli, "get_dekart_url", return_value="http://localhost:8080"))
             stack.enter_context(
                 mock.patch.object(cli, "load_config", return_value={"local_snapshot": {"enabled": True}})
@@ -64,11 +74,14 @@ class HandleSnapshotUrlTest(unittest.TestCase):
                 remote_only=remote_only,
                 raw_json=raw_json,
                 debug=debug,
+                zoom=zoom,
+                lat=lat,
+                lon=lon,
             )
-        return status, stdout.getvalue(), stderr.getvalue(), render, download
+        return status, stdout.getvalue(), stderr.getvalue(), render, download, mcp_call
 
     def test_local_snapshot_resolves_render_url_and_reports_it(self):
-        status, stdout, stderr, render, download = self.run_snapshot(
+        status, stdout, stderr, render, download, _mcp_call = self.run_snapshot(
             {
                 "snapshot_render_url": "/reports/report-1/snapshot?snapshot_token=abc",
             },
@@ -84,7 +97,7 @@ class HandleSnapshotUrlTest(unittest.TestCase):
         self.assertEqual(json.loads(stdout)["snapshot_render_url"], expected_url)
 
     def test_remote_snapshot_resolves_download_url_and_reports_it(self):
-        status, stdout, _stderr, render, download = self.run_snapshot(
+        status, stdout, _stderr, render, download, _mcp_call = self.run_snapshot(
             {
                 "snapshot_url": "/reports/report-1/snapshot.png?token=abc",
             },
@@ -97,6 +110,76 @@ class HandleSnapshotUrlTest(unittest.TestCase):
         render.assert_not_called()
         download.assert_called_once_with(expected_url, timeout_seconds=90)
         self.assertEqual(json.loads(stdout)["snapshot_url"], expected_url)
+
+    def test_snapshot_viewport_params_are_sent_to_mcp(self):
+        status, stdout, _stderr, _render, _download, mcp_call = self.run_snapshot(
+            {
+                "snapshot_render_url": "/reports/report-1/snapshot?snapshot_token=abc&zoom=12&lat=52.52&lon=13.405",
+            },
+            raw_json=True,
+            zoom=12,
+            lat=52.52,
+            lon=13.405,
+        )
+
+        self.assertEqual(status, 0)
+        mcp_call.assert_called_once_with(
+            "create_report_snapshot",
+            {"report_id": "report-1", "zoom": 12.0, "lat": 52.52, "lon": 13.405},
+            timeout_seconds=90,
+        )
+        self.assertEqual(json.loads(stdout)["snapshot_viewport"], {"zoom": 12.0, "lat": 52.52, "lon": 13.405})
+
+    def test_snapshot_rejects_lat_without_lon(self):
+        status, _stdout, stderr, _render, _download, mcp_call = self.run_snapshot(
+            {
+                "snapshot_url": "/reports/report-1/snapshot.png?token=abc",
+            },
+            remote_only=True,
+            lat=52.52,
+        )
+
+        self.assertEqual(status, 2)
+        self.assertIn("Invalid --lat/--lon: pass both latitude and longitude.", stderr)
+        mcp_call.assert_not_called()
+
+    def test_snapshot_rejects_out_of_range_viewport_values(self):
+        cases = (
+            {"zoom": -1, "message": "Invalid --zoom: must be between 0 and 24."},
+            {"zoom": float("nan"), "message": "Invalid --zoom: must be between 0 and 24."},
+            {"lat": -91, "lon": 13.405, "message": "Invalid --lat: must be between -90 and 90."},
+            {"lat": float("nan"), "lon": 13.405, "message": "Invalid --lat: must be between -90 and 90."},
+            {"lat": 52.52, "lon": 181, "message": "Invalid --lon: must be between -180 and 180."},
+            {"lat": 52.52, "lon": float("nan"), "message": "Invalid --lon: must be between -180 and 180."},
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                status, _stdout, stderr, _render, _download, mcp_call = self.run_snapshot(
+                    {
+                        "snapshot_url": "/reports/report-1/snapshot.png?token=abc",
+                    },
+                    remote_only=True,
+                    zoom=case.get("zoom"),
+                    lat=case.get("lat"),
+                    lon=case.get("lon"),
+                )
+
+                self.assertEqual(status, 2)
+                self.assertIn(case["message"], stderr)
+                mcp_call.assert_not_called()
+
+
+class SnapshotParserTest(unittest.TestCase):
+    def test_snapshot_parses_viewport_arguments(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(
+            ["snapshot", "--report-id", "report-1", "--zoom", "12", "--lat", "52.52", "--lon", "13.405"]
+        )
+
+        self.assertEqual(args.command, "snapshot")
+        self.assertEqual(args.zoom, 12.0)
+        self.assertEqual(args.lat, 52.52)
+        self.assertEqual(args.lon, 13.405)
 
 
 if __name__ == "__main__":

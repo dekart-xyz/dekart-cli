@@ -13,6 +13,24 @@ def completed(code=0, stdout="", stderr=""):
 
 
 class DockerContractTest(unittest.TestCase):
+    def test_run_command_streams_and_captures_output(self):
+        process = mock.Mock()
+        process.stdout = io.StringIO("Pulling image\ncontainer-id\n")
+        process.wait.return_value = 0
+        stdout = io.StringIO()
+        with mock.patch.object(local_docker.subprocess, "Popen", return_value=process) as popen, redirect_stdout(stdout):
+            result = local_docker.run_command(["docker", "run", "image"], stream_output=True)
+        self.assertEqual(stdout.getvalue(), "Pulling image\ncontainer-id\n")
+        self.assertEqual(result["stdout"], stdout.getvalue())
+        self.assertEqual(result["code"], 0)
+        popen.assert_called_once_with(
+            ["docker", "run", "image"],
+            stdout=local_docker.subprocess.PIPE,
+            stderr=local_docker.subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
     def test_run_command_is_persistent_labeled_and_loopback_only(self):
         command = local_docker.docker_run_command(8083)
         rendered = local_docker.format_command(command)
@@ -389,6 +407,7 @@ class LifecycleTest(unittest.TestCase):
             result = local_docker.up()
         self.assertEqual(result["code"], 0)
         self.assertEqual(run.call_args.args[0], local_docker.docker_run_command(8081))
+        self.assertTrue(run.call_args.kwargs["stream_output"])
 
     def test_up_starts_stopped_managed_container(self):
         stopped = local_docker._base_status("stopped", port=8080, managed=True)
@@ -422,6 +441,7 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(result["code"], 0)
         self.assertEqual(run.call_args_list[0].args[0], ["docker", "rm", "dekart-local"])
         self.assertIn("dekart-local-data:/dekart/data", run.call_args_list[1].args[0])
+        self.assertTrue(run.call_args_list[1].kwargs["stream_output"])
 
     def test_up_refuses_foreign_container(self):
         conflict = local_docker._base_status("ownership_conflict", port=8080)

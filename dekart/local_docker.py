@@ -6,6 +6,7 @@ import platform
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -24,7 +25,37 @@ def local_url(port):
     return "http://localhost:{0}".format(port)
 
 
-def run_command(command):
+def run_command(command, stream_output=False):
+    if stream_output:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        output = []
+        try:
+            if process.stdout is not None:
+                for chunk in iter(process.stdout.readline, ""):
+                    output.append(chunk)
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+            code = process.wait()
+        except KeyboardInterrupt:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise
+        return {
+            "code": code,
+            "stdout": "".join(output),
+            "stderr": "",
+            "command": " ".join(command),
+        }
     result = subprocess.run(command, check=False, capture_output=True, text=True)
     return {
         "code": result.returncode,
@@ -331,9 +362,11 @@ def _failure_with_logs(message, port=None):
     }
 
 
-def _run_mutation(command, on_execute=None):
+def _run_mutation(command, on_execute=None, stream_output=False):
     if on_execute:
         on_execute(format_command(command))
+    if stream_output:
+        return run_command(command, stream_output=True)
     return run_command(command)
 
 
@@ -378,7 +411,7 @@ def up(wait_timeout=STARTUP_TIMEOUT_SECONDS, preferred_port=None, reuse_external
             if remove["code"] != 0:
                 return {"code": 1, "message": "Could not recreate managed container: {0}".format(remove["stderr"].strip()), "status": status}
             command = docker_run_command(port)
-            result = _run_mutation(command, on_execute=on_execute)
+            result = _run_mutation(command, on_execute=on_execute, stream_output=True)
     else:
         port = status.get("port") or first_available_port()
         if port is None:
@@ -387,10 +420,11 @@ def up(wait_timeout=STARTUP_TIMEOUT_SECONDS, preferred_port=None, reuse_external
         if prepared["code"] != 0:
             return {"code": prepared["code"], "message": prepared["message"], "status": status}
         command = docker_run_command(port)
-        result = _run_mutation(command, on_execute=on_execute)
+        result = _run_mutation(command, on_execute=on_execute, stream_output=True)
 
     if result["code"] != 0:
-        return _failure_with_logs("Docker could not start Dekart: {0}".format(result["stderr"].strip()), port=port)
+        detail = (result["stderr"] or result["stdout"]).strip()
+        return _failure_with_logs("Docker could not start Dekart: {0}".format(detail), port=port)
     url = local_url(port)
     if not wait_for_dekart(url, timeout_seconds=wait_timeout):
         return _failure_with_logs("Dekart did not become healthy within {0} seconds.".format(wait_timeout), port=port)

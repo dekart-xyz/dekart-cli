@@ -17,6 +17,8 @@ import webbrowser
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 
+from dekart import local_docker
+
 DEFAULT_DEKART_URL = "https://cloud.dekart.xyz"
 LOCALHOST_DEKART_URL = "http://localhost:8080"
 DEFAULT_VERSION_CHECK_URL = "https://cloud.dekart.xyz/api/v1/version/dekart"
@@ -48,6 +50,16 @@ def build_parser():
         default="ask",
         help="After auth, ask/install/skip local headless snapshot capability (default: ask).",
     )
+
+    local = subparsers.add_parser("local", help="Manage local Dekart with Docker.")
+    local_subparsers = local.add_subparsers(dest="local_action")
+    local_subparsers.add_parser("up", help="Start local Dekart in Docker.")
+    local_subparsers.add_parser("down", help="Stop local Dekart and preserve its data.")
+    local_remove = local_subparsers.add_parser("remove", help="Remove local Dekart and permanently delete its data.")
+    local_remove.add_argument("-f", "--force", action="store_true", help="Delete without confirmation.")
+    local_status = local_subparsers.add_parser("status", help="Show local Dekart status and URL.")
+    local_status.add_argument("--json", action="store_true", help="Print machine-readable status JSON.")
+    local.set_defaults(local_action="status")
 
     tools = subparsers.add_parser("tools", help="List MCP tools from configured Dekart.")
     tools.add_argument(
@@ -967,54 +979,183 @@ def save_dekart_url(url):
     save_config(config_path, config)
 
 
-def prompt_init_dekart_url():
-    """Prompt user to select Dekart endpoint for init flow."""
-    print(ansi_rgb("[Step 1 of 3] Select Dekart endpoint", 112, 181, 208, bold=True))
-    print("Choose where this CLI should connect:")
-    current_url = get_dekart_url().rstrip("/")
-    default_index = 0
-    custom_default = ""
-    if current_url == LOCALHOST_DEKART_URL:
-        default_index = 1
-    elif current_url and current_url != DEFAULT_DEKART_URL:
-        default_index = 2
-        custom_default = current_url
-    options = [
-        f"Dekart Cloud (SaaS, default): {DEFAULT_DEKART_URL}",
-        f"Local Dekart: {LOCALHOST_DEKART_URL}",
-        "Custom URL",
-    ]
+def _select_local_action(options, default_index=0):
+    labels = [label for _action, label in options]
     cursor_selection = select_menu_option(
-        title="Select endpoint option",
-        options=options,
+        title="Choose how to use Local Dekart",
+        options=labels,
         default_index=default_index,
     )
     if cursor_selection == "cancel":
-        selected_url = current_url or DEFAULT_DEKART_URL
-        print("Selection cancelled. Keeping current endpoint.")
-        print(f"Selected endpoint: {selected_url}")
-        print("You can change it later with: dekart config --url <URL>")
-        print()
-        return selected_url
-
+        return "cancel"
     if cursor_selection is None:
-        print(f"  1) {options[0]}")
-        print(f"  2) {options[1]}")
-        print(f"  3) {options[2]}")
+        for index, label in enumerate(labels, start=1):
+            print("  {0}) {1}".format(index, label))
         print()
         default_choice = str(default_index + 1)
-        choice = input(f"Select [1/2/3] (default: {default_choice}): ").strip()
+        choice = input("Choose [1-{0}] (default: {1}): ".format(len(options), default_choice)).strip()
         if not choice:
             choice = default_choice
-        elif choice not in {"1", "2", "3"}:
-            print(f"Unknown choice '{choice}', defaulting to current endpoint.")
+        if not choice.isdigit() or not 1 <= int(choice) <= len(options):
+            print("Unknown choice, using the default.")
             choice = default_choice
-    else:
-        choice = str(cursor_selection + 1)
+        return options[int(choice) - 1][0]
+    return options[cursor_selection][0]
 
-    if choice == "2":
-        selected_url = LOCALHOST_DEKART_URL
-    elif choice == "3":
+
+def _manual_local_command(port):
+    if port:
+        return local_docker.standalone_docker_run_command(port)
+    return None
+
+
+def prompt_local_dekart_url(docker_state="running"):
+    """Offer explicit start, connect, and manual paths for Local Dekart."""
+    status = local_docker.get_status()
+    state = status.get("status")
+    detected_port = status.get("port")
+    can_manage_docker = docker_state == "running"
+    if state == "absent":
+        free_port = detected_port
+    elif state == "external":
+        free_port = local_docker.first_available_port()
+    elif state == "docker_unavailable":
+        free_port = local_docker.first_available_port()
+    elif state == "stopped":
+        free_port = detected_port
+    else:
+        free_port = local_docker.first_available_port()
+    options = []
+
+    if can_manage_docker and state == "stopped" and detected_port:
+        options.append(("start", "Start existing local Dekart Docker now on port {0}".format(detected_port)))
+    elif can_manage_docker and state == "unhealthy" and detected_port:
+        options.append(("start", "Wait for local Dekart Docker on port {0}".format(detected_port)))
+    elif can_manage_docker and state not in {"running", "ownership_conflict"} and free_port:
+        options.append(("start", "Start new local Dekart Docker now on port {0}".format(free_port)))
+
+    if state in {"running", "external"} and detected_port:
+        options.append(("connect", "Connect to running Dekart on port {0}".format(detected_port)))
+
+    options.append(("manual", "I will start or connect to Dekart myself"))
+    if not can_manage_docker:
+        options.append(("back", "Back to backend choices"))
+    action = _select_local_action(options)
+    if action == "cancel":
+        print("Local setup cancelled.")
+        return None
+    if action == "back":
+        return "back"
+
+    if action == "connect":
+        print("Using running Dekart at {0}.".format(status["url"]))
+        return status["url"]
+
+    if action == "start":
+        result = local_docker.up(
+            preferred_port=free_port,
+            reuse_external=state != "external",
+            on_execute=local_docker.print_executing,
+        )
+        local_docker.print_result(result)
+        if result["code"] != 0:
+            raise LocalSetupError(result["code"])
+        local_docker.print_management_commands()
+        return result["status"]["url"]
+
+    planned_port = free_port or detected_port
+    command = _manual_local_command(planned_port)
+    if command:
+        print("Run this command in another terminal:")
+        print("  {0}".format(local_docker.format_command(command)))
+    elif state == "ownership_conflict":
+        print(status.get("message", "The dekart-local container is not managed by this CLI."))
+        print("The CLI will not modify it.")
+
+    default_url = local_docker.local_url(planned_port) if planned_port else status.get("url", "")
+    while True:
+        prompt = "Enter Dekart URL"
+        if default_url:
+            prompt += " (default: {0})".format(default_url)
+        entered_url = input(prompt + ": ").strip().rstrip("/")
+        selected_url = entered_url or default_url
+        if is_valid_http_url(selected_url):
+            break
+        print("Invalid URL. Example: http://localhost:8080")
+
+    parsed_url = urlparse(selected_url)
+    is_local_url = parsed_url.hostname in {"localhost", "127.0.0.1", "::1"}
+    if is_local_url and not local_docker.is_dekart_endpoint(selected_url):
+        print("Dekart is not reachable at {0} yet.".format(selected_url))
+        print("Setup paused. Start Dekart, then run dekart init again.")
+        return None
+    if is_local_url:
+        print("Connected to Dekart at {0}.".format(selected_url))
+    else:
+        print("Using Dekart endpoint: {0}.".format(selected_url))
+    return selected_url
+
+
+def prompt_init_dekart_url():
+    """Prompt user to select Dekart endpoint for init flow."""
+    print(ansi_rgb("[Step 1 of 3] Map backend", 112, 181, 208, bold=True))
+    print("Dekart turns your SQL results into maps. Where should it run?")
+    current_url = get_dekart_url().rstrip("/")
+    default_index = 1
+    custom_default = ""
+    if current_url and current_url != DEFAULT_DEKART_URL and not current_url.startswith("http://localhost:"):
+        custom_default = current_url
+    while True:
+        docker_state = local_docker.docker_availability()
+        local_label = "Local (Docker)   On your machine. Data stays local."
+        if docker_state == "missing":
+            local_label = "Local (Docker required)   Install Docker to run on your machine."
+        elif docker_state == "stopped":
+            local_label = "Local (start Docker)   Docker is installed but not running."
+        options = [
+            local_label,
+            "Dekart Cloud     Fastest. Sign in, nothing to install.",
+            "Self-hosted      I already run Dekart somewhere.",
+        ]
+        cursor_selection = select_menu_option(
+            title="Select backend option",
+            options=options,
+            default_index=default_index,
+        )
+        if cursor_selection == "cancel":
+            selected_url = current_url or DEFAULT_DEKART_URL
+            print("Selection cancelled. Keeping current endpoint.")
+            print(f"Selected endpoint: {selected_url}")
+            print("You can change it later with: dekart config --url <URL>")
+            print()
+            return selected_url
+
+        if cursor_selection is None:
+            print(f"  1) {options[0]}")
+            print(f"  2) {options[1]}")
+            print(f"  3) {options[2]}")
+            print()
+            choice = input("Choose [1-3] (default: 2): ").strip() or "2"
+            if choice not in {"1", "2", "3"}:
+                print(f"Unknown choice '{choice}', defaulting to Dekart Cloud.")
+                choice = "2"
+        else:
+            choice = str(cursor_selection + 1)
+
+        if choice != "1":
+            break
+        if docker_state != "running":
+            print(local_docker.docker_guidance(docker_state))
+            print("You can install/start Docker, enter another Dekart URL, or go back.")
+            print()
+        selected_url = prompt_local_dekart_url(docker_state=docker_state)
+        if selected_url == "back":
+            continue
+        if not selected_url:
+            return None
+        break
+
+    if choice == "3":
         while True:
             if custom_default:
                 prompt = f"Enter custom http(s) URL (default: {custom_default}): "
@@ -1027,7 +1168,7 @@ def prompt_init_dekart_url():
                 selected_url = custom
                 break
             print("Invalid URL. Example: https://my-dekart.company.com")
-    else:
+    elif choice == "2":
         selected_url = DEFAULT_DEKART_URL
 
     print(f"Selected endpoint: {selected_url}")
@@ -2543,12 +2684,31 @@ def build_device_name():
     return f"{node_name} ({system_name})"
 
 
+class LocalSetupError(Exception):
+    """Signal that interactive local setup failed before authorization."""
+
+    def __init__(self, exit_code):
+        super().__init__("Local Dekart setup failed")
+        self.exit_code = exit_code
+
+
 def handle_init(no_browser, local_snapshot_mode):
     """Run device authorization flow and save returned Dekart CLI token."""
     interactive = is_interactive_terminal()
     if interactive:
         print_init_banner()
-        dekart_url = prompt_init_dekart_url().rstrip("/")
+        try:
+            selected_url = prompt_init_dekart_url()
+        except LocalSetupError as exc:
+            return exc.exit_code
+        except KeyboardInterrupt:
+            print("\nSetup cancelled.", file=sys.stderr)
+            return 130
+        if not selected_url:
+            return 0
+        dekart_url = selected_url.rstrip("/")
+        if dekart_url.startswith("http://localhost:"):
+            save_dekart_url(dekart_url)
     else:
         dekart_url = get_dekart_url().rstrip("/")
         print(ansi_rgb("[Step 1 of 3] Select Dekart endpoint", 112, 181, 208, bold=True))
@@ -2720,6 +2880,15 @@ def main():
         raise SystemExit(handle_config(args.url))
     if args.command == "init":
         raise SystemExit(handle_init(args.no_browser, args.local_snapshot))
+    if args.command == "local":
+        raise SystemExit(
+            local_docker.handle_local(
+                args.local_action,
+                getattr(args, "json", False),
+                save_url=save_dekart_url,
+                force=getattr(args, "force", False),
+            )
+        )
     if args.command == "tools":
         raise SystemExit(handle_tools(args.json, args.names, args.match, args.schema, args.arg_keys))
     if args.command == "resolve-tools":

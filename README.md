@@ -7,8 +7,8 @@ Works best with the [geosql](https://github.com/dekart-xyz/geosql) skill — it 
 Works with any Dekart instance:
 
 - **Dekart Cloud** (SaaS, default)
+- **Local (Docker)** (on your machine with persistent local data)
 - **Self-hosted** (your own URL)
-- **Localhost** (`http://localhost:8080`)
 
 ## Init
 
@@ -31,6 +31,36 @@ dekart init
 ```
 
 Config and token: `~/.config/dekart/`.
+
+## Local Dekart with Docker
+
+Choose Local during `dekart init`, or manage it directly:
+
+```bash
+dekart local up
+dekart local status
+dekart local status --json
+dekart local down
+dekart local remove
+```
+
+The CLI uses a labeled container named `dekart-local` and a labeled persistent Docker volume named `dekart-local-data`. `down` stops the container without deleting the container or volume. `remove` asks for confirmation, then removes both the container and its data volume; use `remove --force` to skip confirmation. If port 8080 is occupied by another service, the CLI selects the first free port through 8099 and saves that URL before authorization begins.
+
+When the CLI starts or stops Docker, it prints `Executing: <docker command>` before running it. You can also choose “I will start or connect to Dekart myself” during `dekart init`; the CLI prints a simple standalone `docker run` command without CLI labels, container names, or volumes, then asks for the Dekart URL.
+
+The initial Docker command is:
+
+```bash
+docker run -d \
+  --name dekart-local \
+  --label xyz.dekart.cli.managed=true \
+  --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v dekart-local-data:/dekart/data \
+  dekartxyz/dekart:latest
+```
+
+The CLI never starts, stops, removes, or replaces a same-name container without its management label. Docker is not installed or started automatically; `dekart init` gives platform-specific instructions when it is unavailable.
 
 ## Enable local snapshot
 

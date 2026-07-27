@@ -32,6 +32,10 @@ dekart init
 
 Config and token: `~/.config/dekart/`.
 
+## Version telemetry
+
+The CLI sends a best-effort version check with its package version and an opaque random installation ID. GeoSQL and Dekart CLI share the ID at `${XDG_CONFIG_HOME:-~/.config}/dekart/installation_id`; deleting that file resets it. Set `DO_NOT_TRACK=1` (or `DNT=1`) to disable the version check before an ID is created. CI sends a reserved non-persisted test ID.
+
 ## Local Dekart with Docker
 
 Choose Local during `dekart init`, or manage it directly:
@@ -87,6 +91,14 @@ dekart snapshot --report-id <id> --zoom 12 --lat 52.52 --lon 13.405 --out ./snap
 ```
 
 `--zoom` accepts `0` through `24`. Use `--lat` and `--lon` together.
+
+When the server provides a verified render-URL lifetime and an established local
+page or browser target closes unexpectedly, the CLI retries once with a fresh
+browser and the same per-operation timeout. Browser launch failures and normal
+timeouts are not retried; increase a normal timeout explicitly, for example with
+`--timeout 180`.
+Remote capture is never selected automatically. Use `--remote-only` when the
+configured Dekart instance provides a remote snapshot endpoint.
 
 ## Run Prepared Query And Download Rows
 

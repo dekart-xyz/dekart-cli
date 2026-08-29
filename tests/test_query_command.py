@@ -30,6 +30,7 @@ class HandleRunQueryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with ExitStack() as stack:
                 stack.enter_context(mock.patch.object(cli, "mcp_call", side_effect=fake_mcp_call))
+                stack.enter_context(mock.patch.object(cli, "supports_duckdb_execution", return_value=True))
                 wait = stack.enter_context(
                     mock.patch.object(
                         cli,
@@ -80,7 +81,7 @@ class HandleRunQueryTest(unittest.TestCase):
             [name for name, _args, _timeout, _return_metadata in calls],
             ["run_query"],
         )
-        self.assertEqual(calls[0][1], {"query_id": "query-1"})
+        self.assertEqual(calls[0][1], {"query_id": "query-1", "accept_duckdb_execution": True})
         wait.assert_called_once_with("job-1", True, 300, 5)
         downloader.assert_called_once()
         self.assertEqual(Path(downloader.call_args.args[2]).name, "result-1.parquet")
@@ -154,6 +155,7 @@ class HandleRunQueryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with ExitStack() as stack:
                 stack.enter_context(mock.patch.object(cli, "mcp_call", side_effect=fake_mcp_call))
+                stack.enter_context(mock.patch.object(cli, "supports_duckdb_execution", return_value=True))
                 stack.enter_context(mock.patch.object(cli, "download_binary", return_value=b"a,b\n1,2\n"))
                 stack.enter_context(mock.patch.object(cli, "get_dekart_url", return_value="https://dekart"))
                 stack.enter_context(redirect_stdout(stdout))
@@ -171,7 +173,7 @@ class HandleRunQueryTest(unittest.TestCase):
 
         self.assertEqual(status, 0, stderr.getvalue())
         self.assertEqual([name for name, _args, _timeout, _return_metadata in calls], ["run_query", "check_job_status"])
-        self.assertEqual(calls[0][1], {"query_id": "query-1"})
+        self.assertEqual(calls[0][1], {"query_id": "query-1", "accept_duckdb_execution": True})
         self.assertEqual(calls[1][1], {"job_id": "job-1"})
         self.assertEqual(json.loads(stdout.getvalue())["result_file"], str(Path(directory) / "result-1.csv"))
 
@@ -431,10 +433,11 @@ class ParserTest(unittest.TestCase):
 
     def test_run_query_parses_required_arguments(self):
         parser = cli.build_parser()
-        args = parser.parse_args(["run-query", "--query-id", "query-1", "--out-dir", "/tmp/results", "--json"])
+        args = parser.parse_args(["run-query", "--query-id", "query-1", "--params-json", '{"limit": 2}', "--out-dir", "/tmp/results", "--json"])
         self.assertEqual(args.command, "run-query")
         self.assertEqual(args.query_id, "query-1")
         self.assertEqual(args.out_dir, "/tmp/results")
+        self.assertEqual(args.params_json, '{"limit": 2}')
         self.assertTrue(args.json)
 
     def test_query_is_not_a_subcommand(self):

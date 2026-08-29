@@ -108,7 +108,13 @@ Run an already-prepared Dekart query, wait for the job, and save result rows:
 dekart run-query --query-id <query-id> --out-dir ./results --wait --json
 ```
 
-Queries wait by default; use `--no-wait` only when you expect an already-finished job. Prepare the query separately with `dekart call --name create_query` and `dekart call --name update_query`, then use `dekart run-query` to run, poll, and download the result. Use `--json` to return `dataset_id`, `query_id`, `job_id`, terminal status, and `result_file` metadata. Empty downloads fail with `empty result (metadata/SHOW statement?)`.
+Pass saved report parameter values as JSON when needed:
+
+```bash
+dekart run-query --query-id <query-id> --params-json '{"row_limit":"10"}' --out-dir ./results --json
+```
+
+Queries wait by default. Connection queries run and download their warehouse result as before. On a compatible Dekart server, DuckDB queries download their pinned file or warehouse inputs, execute the server-prepared program locally, and save `<query-job-id>.parquet`. `--no-wait` returns pending metadata without downloads when a DuckDB warehouse input is still running. Use `--json` for machine-readable metadata or `--print` for rows. A DuckDB version mismatch emits a warning to stderr and continues best effort. The first local DuckDB run may need access to DuckDB's official extension repository for signed spatial/parquet extensions; later runs reuse DuckDB's standard cache.
 
 Resolve a report URL explicitly from a report id:
 

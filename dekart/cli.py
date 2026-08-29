@@ -7,6 +7,7 @@ import os
 import platform
 import re
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from dekart import local_docker
+from dekart import duckdb_execution
 from dekart.installation_id import get_installation_id
 
 DEFAULT_DEKART_URL = "https://cloud.dekart.xyz"
@@ -327,6 +329,11 @@ def build_parser():
         help="Run an already-prepared Dekart query and download result rows.",
     )
     run_query.add_argument("--query-id", required=True, help="Prepared Dekart query id to run.")
+    run_query.add_argument(
+        "--params-json",
+        default="{}",
+        help="Query parameter values as a JSON object.",
+    )
     run_query.add_argument(
         "--out-dir",
         help="Directory for downloaded result file. Filename is resolved from job metadata.",
@@ -1659,6 +1666,9 @@ def request_id_from_headers(headers):
 
 def parse_http_error_body(exc):
     """Read and parse HTTPError response body for diagnostics."""
+    cached = getattr(exc, "_dekart_error_body", None)
+    if cached is not None:
+        return cached
     raw_text = ""
     parsed = None
     try:
@@ -1676,7 +1686,9 @@ def parse_http_error_body(exc):
                 parsed = candidate
         except json.JSONDecodeError:
             parsed = None
-    return raw_text, parsed
+    result = (raw_text, parsed)
+    setattr(exc, "_dekart_error_body", result)
+    return result
 
 
 def find_nested_string(payload, path):
@@ -2877,18 +2889,28 @@ def download_query_job_result(job_id_value, query_job, out, timeout_seconds=60):
         raise ValueError("Could not resolve dataset id from job.")
 
     extension = resolve_job_result_extension(query_job)
-    dekart_url = get_dekart_url().rstrip("/")
-    source_url = f"{dekart_url}/api/v1/dataset-source/{dataset_ref}/{source_id}.{extension}"
-    body = download_binary(source_url, timeout_seconds=timeout_seconds)
     output_path = Path(out or f"job-{job_id_value}.{extension}").expanduser()
-    saved = save_binary_file(output_path, body)
+    saved, size = download_dataset_source(dataset_ref, source_id, extension, output_path, timeout_seconds)
     return {
         "job_result_id": source_id,
         "dataset_ref": dataset_ref,
         "result_extension": extension,
         "path": str(saved),
-        "bytes": len(body),
+        "bytes": size,
     }
+
+
+def download_dataset_source(dataset_id, source_id, extension, output_path, timeout_seconds=60):
+    """Download one authenticated dataset source to a local path."""
+    dekart_url = get_dekart_url().rstrip("/")
+    source_url = "{0}/api/v1/dataset-source/{1}/{2}.{3}".format(
+        dekart_url,
+        quote(dataset_id, safe=""),
+        quote(source_id, safe=""),
+        extension,
+    )
+    body = download_binary(source_url, timeout_seconds=timeout_seconds)
+    return save_binary_file(output_path, body), len(body)
 
 
 def required_nested_scalar(payload, paths, label):
@@ -2936,18 +2958,180 @@ def handle_report_url(report_id, raw_json):
     return 0
 
 
-def run_prepared_query(query_id_value, timeout_seconds):
-    """Run an existing query and return the new job id."""
-    run_payload = mcp_call("run_query", {"query_id": query_id_value}, timeout_seconds=timeout_seconds)
+def encode_query_params_values(params_json):
+    """Encode a JSON object as Dekart qp_ execution values."""
+    try:
+        values = json.loads(str(params_json or "{}"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("Invalid --params-json: {0}".format(exc)) from exc
+    if not isinstance(values, dict):
+        raise ValueError("Invalid --params-json: expected a JSON object.")
+    encoded = []
+    for key, value in values.items():
+        name = str(key).strip()
+        if not name:
+            raise ValueError("Invalid --params-json: parameter names must not be empty.")
+        if isinstance(value, (dict, list)):
+            raise ValueError("Invalid --params-json: values must be scalars.")
+        if value is None:
+            text = ""
+        elif isinstance(value, bool):
+            text = "true" if value else "false"
+        else:
+            text = str(value)
+        encoded.append(("qp_" + name, text))
+    return urlencode(encoded)
+
+
+def supports_duckdb_execution():
+    """Discover whether run_query accepts the additive DuckDB opt-in."""
+    try:
+        payload = fetch_mcp_tools_payload()
+    except Exception:
+        return None
+    tools = payload.get("tools", []) if isinstance(payload, dict) else []
+    run_tool = next(
+        (tool for tool in tools if isinstance(tool, dict) and tool.get("name") == "run_query"),
+        None,
+    )
+    return "accept_duckdb_execution" in tool_properties(run_tool)
+
+
+def run_prepared_query(query_id_value, query_params_values, timeout_seconds):
+    """Run a saved query and return either a connection job or DuckDB program."""
+    supports_duckdb = supports_duckdb_execution()
+    can_execute_duckdb = sys.version_info >= (3, 9)
+    arguments = {"query_id": query_id_value}
+    if query_params_values:
+        arguments["query_params_values"] = query_params_values
+    if supports_duckdb and can_execute_duckdb:
+        arguments["accept_duckdb_execution"] = True
+    try:
+        run_payload = mcp_call("run_query", arguments, timeout_seconds=timeout_seconds)
+    except urllib.error.HTTPError as exc:
+        raw_body, _parsed_body = parse_http_error_body(exc)
+        if "RunDuckDBQuery" not in raw_body and "DuckDB" not in raw_body:
+            raise
+        if supports_duckdb is None:
+            raise RuntimeError(
+                "Could not discover DuckDB execution support; retry when the Dekart server is available."
+            ) from exc
+        if supports_duckdb and not can_execute_duckdb:
+            raise RuntimeError("DuckDB query execution requires Python 3.9 or newer.") from exc
+        if not supports_duckdb:
+            raise RuntimeError(
+                "DuckDB execution requires a newer Dekart server; connection queries remain available."
+            ) from exc
+        raise
+    result = run_payload.get("result", {}) if isinstance(run_payload, dict) else {}
+    if isinstance(result, dict) and "duckdb_execution" in result:
+        query_job, execution = duckdb_execution.validate_prepared_execution(result)
+        if str(query_job.get("query_id", "")).strip() != query_id_value:
+            raise ValueError("DuckDB query_job.query_id does not match the requested query.")
+        return {
+            "query_id": query_id_value,
+            "job_id": query_job["id"],
+            "query_job": query_job,
+            "duckdb_execution": execution,
+        }
     job_id = required_nested_scalar(
         run_payload,
         ("result.query_job.id", "result.queryJob.id", "result.job_id", "result.id"),
         "job id",
     )
+    return {"query_id": query_id_value, "job_id": job_id}
+
+
+def prepared_source_jobs(metadata, wait, timeout_seconds, interval_seconds):
+    """Poll and validate every exact warehouse source before downloads."""
+    ready_jobs = {}
+    pending = []
+    for source in metadata["duckdb_execution"]["sources"]:
+        source_job_id = str(source.get("query_job_id", "")).strip()
+        if not source_job_id:
+            continue
+        query_job = wait_for_query_job(source_job_id, wait, timeout_seconds, interval_seconds)
+        if not is_terminal_done_status(query_job):
+            pending.append({
+                "job_id": source_job_id,
+                "dataset_id": source["dataset_id"],
+                "job_status": query_job_status(query_job),
+            })
+            continue
+        if str(query_job.get("dataset_id", "")).strip() != source["dataset_id"]:
+            raise ValueError("DuckDB source job dataset_id does not match the prepared source.")
+        result_id = str(query_job.get("job_result_id", "")).strip()
+        if not result_id:
+            raise ValueError("DuckDB source job_result_id is missing.")
+        extension = str(query_job.get("result_extension", "")).strip().lower()
+        if extension != str(source["extension"]).strip().lower():
+            raise ValueError("DuckDB source result_extension does not match the prepared source.")
+        ready_jobs[source_job_id] = query_job
+    return ready_jobs, pending
+
+
+def download_prepared_source(source, index, ready_jobs, directory):
+    """Download one validated file or warehouse revision into the work directory."""
+    dataset_id = str(source["dataset_id"]).strip()
+    extension = str(source["extension"]).strip().lower()
+    source_id = str(source.get("file_source_id", "")).strip()
+    if not source_id:
+        source_job_id = str(source["query_job_id"]).strip()
+        source_id = str(ready_jobs[source_job_id]["job_result_id"]).strip()
+    source_path = Path(directory) / "dekart_source_{0}.{1}".format(index, extension)
+    download_dataset_source(dataset_id, source_id, extension, source_path)
+    return source_path
+
+
+def materialize_duckdb_query(metadata, out_dir, wait, timeout_seconds, interval_seconds):
+    """Resolve prepared inputs and materialize one local DuckDB result."""
+    ready_jobs, pending = prepared_source_jobs(metadata, wait, timeout_seconds, interval_seconds)
+    if pending:
+        return {
+            "query_id": metadata["query_id"],
+            "job_id": metadata["job_id"],
+            "dataset_id": metadata["query_job"]["dataset_id"],
+            "pending_source_jobs": pending,
+            "terminal_status": "PENDING",
+        }
+
+    output_path = Path(out_dir).expanduser() / "{0}.parquet".format(metadata["job_id"])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="dekart-duckdb-") as directory:
+        source_paths = [
+            download_prepared_source(source, index, ready_jobs, directory)
+            for index, source in enumerate(metadata["duckdb_execution"]["sources"])
+        ]
+        temporary_result = Path(directory) / "dekart_result.parquet"
+        duckdb_execution.execute_program(
+            metadata["duckdb_execution"],
+            metadata["query_job"],
+            source_paths,
+            temporary_result,
+            directory,
+        )
+        shutil.move(str(temporary_result), str(output_path))
     return {
-        "query_id": query_id_value,
-        "job_id": job_id,
+        "query_id": metadata["query_id"],
+        "job_id": metadata["job_id"],
+        "dataset_id": metadata["query_job"]["dataset_id"],
+        "terminal_status": "JOB_STATUS_DONE",
+        "result_extension": "parquet",
+        "result_file": str(output_path),
+        "path": str(output_path),
+        "bytes": output_path.stat().st_size,
     }
+
+
+def print_run_query_result(payload, print_rows, raw_json):
+    """Render one completed connection or DuckDB result."""
+    if print_rows:
+        print_query_rows(payload["path"], payload["result_extension"])
+    if raw_json:
+        pretty_print_json(payload)
+    elif not print_rows:
+        print("Saved: {0}".format(payload["path"]))
+        print("Bytes: {0}".format(payload["bytes"]))
 
 
 def print_query_rows(path, extension):
@@ -3061,7 +3245,7 @@ def handle_preview(file_path, limit, schema):
         return 1
 
 
-def handle_run_query(query_id, out_dir, deprecated_out, wait, timeout, interval, print_rows, raw_json):
+def handle_run_query(query_id, out_dir, deprecated_out, wait, timeout, interval, print_rows, raw_json, params_json="{}"):
     """Run a prepared query through Dekart and download result rows."""
     if print_rows and raw_json:
         print("Use either --print or --json, not both.", file=sys.stderr)
@@ -3087,7 +3271,24 @@ def handle_run_query(query_id, out_dir, deprecated_out, wait, timeout, interval,
         return 2
 
     try:
-        metadata = run_prepared_query(query_id_value, timeout_seconds=timeout_seconds)
+        query_params_values = encode_query_params_values(params_json)
+        metadata = run_prepared_query(query_id_value, query_params_values, timeout_seconds=timeout_seconds)
+        if "duckdb_execution" in metadata:
+            payload = materialize_duckdb_query(
+                metadata,
+                out_dir_value,
+                wait,
+                timeout_seconds,
+                interval_seconds,
+            )
+            if payload.get("pending_source_jobs"):
+                if raw_json:
+                    pretty_print_json(payload)
+                else:
+                    print("Pending source jobs: {0}".format(len(payload["pending_source_jobs"])))
+                return 0
+            print_run_query_result(payload, print_rows, raw_json)
+            return 0
         query_job = wait_for_query_job(metadata["job_id"], wait, timeout_seconds, interval_seconds)
         if not is_terminal_done_status(query_job):
             status = str(query_job.get("job_status", "")).strip()
@@ -3112,14 +3313,7 @@ def handle_run_query(query_id, out_dir, deprecated_out, wait, timeout, interval,
             "bytes": download["bytes"],
         }
 
-        if print_rows:
-            print_query_rows(download["path"], download["result_extension"])
-
-        if raw_json:
-            pretty_print_json(payload)
-        elif not print_rows:
-            print(f"Saved: {payload['path']}")
-            print(f"Bytes: {payload['bytes']}")
+        print_run_query_result(payload, print_rows, raw_json)
         return 0
     except TimeoutError as exc:
         print(str(exc), file=sys.stderr)
@@ -3434,6 +3628,7 @@ def main():
         raise SystemExit(
             handle_run_query(
                 query_id=args.query_id,
+                params_json=args.params_json,
                 out_dir=args.out_dir,
                 deprecated_out=args.deprecated_out,
                 wait=args.wait,

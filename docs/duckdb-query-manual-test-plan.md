@@ -10,7 +10,7 @@ This plan is for an agent testing the current `dekart-cli` checkout against a us
 - Do not restart Postgres. If changed Go code must be loaded, restart only the Dekart server with the same environment.
 - Use unique timestamped report titles and leave created reports in place for browser inspection.
 - Require `jq`, Python 3.9+, an authorized `dekart` command, and a writable temporary directory.
-- Permit the first run to reach DuckDB's official extension repository; signed spatial/parquet extensions are reused from DuckDB's standard cache afterward.
+- Permit the first run to reach DuckDB's core and community extension repositories; signed extensions such as Spatial, Parquet, JSON, and H3 are reused from DuckDB's standard cache afterward.
 
 Set reusable values:
 

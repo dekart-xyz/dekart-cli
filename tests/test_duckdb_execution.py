@@ -22,6 +22,16 @@ def prepared_result():
         },
         "duckdb_execution": {
             "duckdb_version": "1.4.3",
+            "extensions": [
+                {
+                    "name": "spatial",
+                    "repository": "core",
+                },
+                {
+                    "name": "h3",
+                    "repository": "community",
+                },
+            ],
             "sources": [
                 {
                     "dataset_id": "source-dataset",
@@ -142,11 +152,25 @@ class PreparedExecutionValidationTest(unittest.TestCase):
         empty_statement = prepared_result()
         empty_statement["duckdb_execution"]["statements"] = [{"sql": ""}]
         cases.append(empty_statement)
-
+        invalid_extension_name = prepared_result()
+        invalid_extension_name["duckdb_execution"]["extensions"][0]["name"] = "h3; LOAD httpfs"
+        cases.append(invalid_extension_name)
+        unsupported_repository = prepared_result()
+        unsupported_repository["duckdb_execution"]["extensions"][0]["repository"] = "CUSTOM"
+        cases.append(unsupported_repository)
         for result in cases:
             with self.subTest(result=result):
                 with self.assertRaises(ValueError):
                     duckdb_execution.validate_prepared_execution(result)
+
+    def test_old_server_uses_legacy_extensions(self):
+        result = prepared_result()
+        result["duckdb_execution"].pop("extensions")
+        _query_job, execution = duckdb_execution.validate_prepared_execution(result)
+        self.assertEqual(
+            duckdb_execution.extension_requirements(execution),
+            [("spatial", "core"), ("parquet", "core")],
+        )
 
     def test_requested_query_must_match_root(self):
         result = prepared_result()
@@ -271,6 +295,51 @@ class PublicationTest(unittest.TestCase):
             print(json.dumps({"ok": True}))
         self.assertIn("Continuing best effort", stderr.getvalue())
         self.assertEqual(json.loads(stdout.getvalue()), {"ok": True})
+
+
+class ExtensionLoadingTest(unittest.TestCase):
+    class Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    class Connection:
+        def __init__(self, installed):
+            self.installed = installed
+            self.calls = []
+
+        def execute(self, sql, parameters=None):
+            self.calls.append((sql, parameters))
+            if sql.startswith("SELECT installed"):
+                return ExtensionLoadingTest.Result(self.installed.get(parameters[0]))
+            return ExtensionLoadingTest.Result(None)
+
+    def test_installs_missing_and_loads_cached_extensions(self):
+        connection = self.Connection({"spatial": (True, False), "json": (True, True)})
+        duckdb_execution.load_extensions(
+            connection,
+            [("spatial", "core"), ("json", "core"), ("h3", "community")],
+        )
+        sql = [call[0] for call in connection.calls]
+        self.assertIn("LOAD spatial", sql)
+        self.assertNotIn("INSTALL spatial FROM core", sql)
+        self.assertNotIn("LOAD json", sql)
+        self.assertIn("INSTALL h3 FROM community", sql)
+        self.assertIn("LOAD h3", sql)
+
+    def test_install_failure_names_extension_and_first_use_network(self):
+        connection = self.Connection({})
+
+        def fail_install(sql, parameters=None):
+            if sql.startswith("INSTALL"):
+                raise RuntimeError("offline")
+            return self.Result(None)
+
+        connection.execute = fail_install
+        with self.assertRaisesRegex(RuntimeError, "h3.*community.*internet"):
+            duckdb_execution.load_extensions(connection, [("h3", "community")])
 
 
 if __name__ == "__main__":

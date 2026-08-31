@@ -5,6 +5,35 @@ from pathlib import Path
 
 SUPPORTED_SOURCE_EXTENSIONS = {"csv", "parquet", "json", "geojson"}
 DOUBLE_TYPES = {"BIGINT", "UBIGINT", "HUGEINT", "UHUGEINT"}
+EXTENSION_NAME = re.compile(r"[a-z][a-z0-9_]*")
+EXTENSION_REPOSITORIES = {"core", "community"}
+LEGACY_EXTENSIONS = [
+    ("spatial", "core"),
+    ("parquet", "core"),
+]
+
+
+def extension_requirements(execution):
+    """Validate server-selected signed extensions before local side effects."""
+    if "extensions" not in execution:
+        return LEGACY_EXTENSIONS
+    extensions = execution["extensions"]
+    if not isinstance(extensions, list):
+        raise ValueError("duckdb_execution.extensions must be an array.")
+    requirements = []
+    for index, extension in enumerate(extensions):
+        if not isinstance(extension, dict):
+            raise ValueError("duckdb_execution.extensions[{0}] is invalid.".format(index))
+        name = str(extension.get("name", "")).strip()
+        repository = str(extension.get("repository", "")).strip()
+        if not EXTENSION_NAME.fullmatch(name):
+            raise ValueError("duckdb_execution.extensions[{0}].name is invalid.".format(index))
+        if repository not in EXTENSION_REPOSITORIES:
+            raise ValueError(
+                "duckdb_execution.extensions[{0}].repository is unsupported.".format(index)
+            )
+        requirements.append((name, repository))
+    return requirements
 
 
 def validate_prepared_execution(result):
@@ -33,6 +62,7 @@ def validate_prepared_execution(result):
         raise ValueError("duckdb_execution.sources must be an array.")
     if not isinstance(statements, list) or not statements:
         raise ValueError("duckdb_execution.statements must be a non-empty array.")
+    extension_requirements(execution)
 
     dataset_ids = set()
     for index, source in enumerate(sources):
@@ -104,6 +134,26 @@ def publication_query(connection, table_reference):
     return "SELECT {0} FROM {1}".format(", ".join(projection), table_reference)
 
 
+def load_extensions(connection, requirements):
+    """Install and load signed server-selected extensions before lockdown."""
+    for name, repository in requirements:
+        installed = connection.execute(
+            "SELECT installed, loaded FROM duckdb_extensions() WHERE extension_name = ?",
+            [name],
+        ).fetchone()
+        if installed and installed[1]:
+            continue
+        try:
+            if not installed or not installed[0]:
+                connection.execute("INSTALL {0} FROM {1}".format(name, repository))
+            connection.execute("LOAD {0}".format(name))
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to prepare signed DuckDB extension {0} from {1}. "
+                "First use may require internet access; retry while online.".format(name, repository)
+            ) from exc
+
+
 def execute_program(execution, query_job, source_paths, result_path, work_dir):
     """Execute opaque prepared statements once and publish the root as Parquet."""
     if sys.version_info < (3, 9):
@@ -113,6 +163,7 @@ def execute_program(execution, query_job, source_paths, result_path, work_dir):
     except Exception as exc:
         raise RuntimeError("DuckDB query execution requires the duckdb Python package.") from exc
 
+    extensions = extension_requirements(execution)
     warn_on_version_mismatch(execution["duckdb_version"], duckdb.__version__)
     work_path = Path(work_dir).resolve()
     result_path = Path(result_path).resolve()
@@ -123,11 +174,8 @@ def execute_program(execution, query_job, source_paths, result_path, work_dir):
     try:
         connection.execute("SET autoinstall_known_extensions=false")
         connection.execute("SET autoload_known_extensions=false")
+        load_extensions(connection, extensions)
         connection.execute("SET allow_community_extensions=false")
-        connection.execute("INSTALL spatial")
-        connection.execute("LOAD spatial")
-        connection.execute("INSTALL parquet")
-        connection.execute("LOAD parquet")
         connection.execute("SET allowed_directories = ?", [[str(work_path)]])
         connection.execute("SET temp_directory = ?", [str(work_path / "tmp")])
         connection.execute("SET enable_external_access=false")

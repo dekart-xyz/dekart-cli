@@ -54,6 +54,12 @@ def build_parser():
         default="ask",
         help="After auth, ask/install/skip local headless snapshot capability (default: ask).",
     )
+    init.add_argument(
+        "--bigquery-passthrough",
+        choices=("ask", "enable", "disable"),
+        default="ask",
+        help="Configure local gcloud authentication for BigQuery passthrough (default: ask).",
+    )
 
     local = subparsers.add_parser("local", help="Manage local Dekart with Docker.")
     local_subparsers = local.add_subparsers(dest="local_action")
@@ -640,6 +646,127 @@ def get_auth_headers():
     return {"Authorization": f"Bearer {token}"}
 
 
+GOOGLE_ACCESS_TOKEN_HEADER = "X-Dekart-Google-Access-Token"
+_google_access_token_cache = {}
+_google_token_warning_shown = False
+
+
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def get_google_bigquery_passthrough_binding():
+    """Return the valid local gcloud binding for the current Dekart identity."""
+    config = load_config(get_config_path())
+    binding = config.get("google_bigquery_passthrough")
+    if not isinstance(binding, dict):
+        return None
+    dekart_url = get_dekart_url().rstrip("/")
+    account = str(binding.get("gcloud_account", "")).strip()
+    if str(binding.get("dekart_url", "")).strip().rstrip("/") != dekart_url or not account:
+        return None
+    token_payload = load_token(get_token_path())
+    if str(token_payload.get("dekart_url", "")).strip().rstrip("/") != dekart_url:
+        return None
+    dekart_email = str(token_payload.get("email", "")).strip()
+    if dekart_email != "UNKNOWN_EMAIL" and dekart_email.casefold() != account.casefold():
+        return None
+    return {"dekart_url": dekart_url, "gcloud_account": account}
+
+
+def mint_google_access_token(account, force_refresh=False):
+    """Mint and process-cache a short-lived gcloud access token."""
+    cache_key = str(account).strip().casefold()
+    if force_refresh:
+        _google_access_token_cache.pop(cache_key, None)
+    if not force_refresh and _google_access_token_cache.get(cache_key):
+        return _google_access_token_cache[cache_key]
+    try:
+        result = subprocess.run(
+            ["gcloud", "auth", "print-access-token", "--account", account],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            "gcloud could not provide an access token. "
+            f"Run `gcloud auth login --account {account}`, then retry."
+        ) from exc
+    token = (result.stdout or "").strip()
+    if result.returncode != 0 or not token or any(character.isspace() for character in token):
+        raise RuntimeError(
+            "gcloud could not provide an access token. "
+            f"Run `gcloud auth login --account {account}`, then retry."
+        )
+    _google_access_token_cache[cache_key] = token
+    return token
+
+
+def is_google_header_url_allowed(url, dekart_url):
+    """Limit the delegated Google token to exact trusted Dekart API URLs."""
+    try:
+        target = urlsplit(str(url or ""))
+        base = urlsplit(str(dekart_url or ""))
+        target_port = target.port or (443 if target.scheme == "https" else 80)
+        base_port = base.port or (443 if base.scheme == "https" else 80)
+    except ValueError:
+        return False
+    same_origin = (
+        target.scheme == base.scheme
+        and (target.hostname or "").casefold() == (base.hostname or "").casefold()
+        and target_port == base_port
+    )
+    secure = target.scheme == "https" or (
+        target.scheme == "http"
+        and target.hostname in {"localhost", "127.0.0.1", "::1", "host.docker.internal"}
+    )
+    api_base = base.path.rstrip("/")
+    mcp_path = f"{api_base}/api/v1/mcp/call"
+    dataset_prefix = f"{api_base}/api/v1/dataset-source/"
+    allowed_path = target.path == mcp_path or (
+        target.path.startswith(dataset_prefix) and bool(target.path[len(dataset_prefix):])
+    )
+    return (
+        same_origin
+        and secure
+        and allowed_path
+        and target.username is None
+        and target.password is None
+        and not target.query
+        and not target.fragment
+    )
+
+
+def get_google_passthrough_headers(url, force_refresh=False):
+    """Build the optional delegated credential header for one trusted URL."""
+    binding = get_google_bigquery_passthrough_binding()
+    if not binding or not is_google_header_url_allowed(url, binding["dekart_url"]):
+        return {}
+    token = mint_google_access_token(binding["gcloud_account"], force_refresh=force_refresh)
+    return {GOOGLE_ACCESS_TOKEN_HEADER: f"Bearer {token}"}
+
+
+def get_optional_google_passthrough_headers(url, force_refresh=False):
+    """Return optional delegated headers without breaking unrelated CLI work."""
+    global _google_token_warning_shown
+    try:
+        return get_google_passthrough_headers(url, force_refresh=force_refresh)
+    except RuntimeError as exc:
+        if not _google_token_warning_shown:
+            print(f"Warning: {exc}", file=sys.stderr)
+            _google_token_warning_shown = True
+        return {}
+
+
+def urlopen_without_redirects(request, timeout_seconds):
+    """Open a credentialed request while refusing every redirect."""
+    opener = urllib.request.build_opener(_RejectRedirects())
+    return opener.open(request, timeout=timeout_seconds)
+
+
 def run_command_capture(cmd):
     """Run subprocess and capture exit code/stdout/stderr as text."""
     result = subprocess.run(
@@ -1163,19 +1290,33 @@ def uninstall_local_snapshot_capability(purge=False):
     }
 
 
-def download_binary(url, timeout_seconds=30):
+def download_binary(url, timeout_seconds=30, google_passthrough=False):
     """Download binary payload from URL with optional auth headers."""
-    headers = {}
-    auth_headers = get_auth_headers()
-    if auth_headers:
-        headers.update(auth_headers)
-    request = urllib.request.Request(
-        url=url,
-        headers=headers,
-        method="GET",
-    )
-    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-        return response.read()
+    for attempt in range(2):
+        headers = {}
+        auth_headers = get_auth_headers()
+        if auth_headers:
+            headers.update(auth_headers)
+        google_headers = {}
+        if google_passthrough:
+            google_headers = get_optional_google_passthrough_headers(url, force_refresh=attempt > 0)
+            headers.update(google_headers)
+        request = urllib.request.Request(url=url, headers=headers, method="GET")
+        try:
+            response_context = (
+                urlopen_without_redirects(request, timeout_seconds)
+                if google_headers
+                else urllib.request.urlopen(request, timeout=timeout_seconds)
+            )
+            with response_context as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            _raw_body, parsed_body = parse_http_error_body(exc)
+            fields = extract_structured_error_fields(parsed_body)
+            if attempt == 0 and google_headers and fields.get("error") == "google_access_token_invalid":
+                exc.close()
+                continue
+            raise
 
 
 def parse_yes_no_input(value, default=True):
@@ -1348,6 +1489,138 @@ def save_dekart_url(url):
     save_config(config_path, config)
 
 
+def configure_google_bigquery_passthrough(mode, dekart_url, dekart_email, interactive):
+    """Configure the non-secret local gcloud binding created by dekart init."""
+    config_path = get_config_path()
+    config = load_config(config_path)
+    binding_key = "google_bigquery_passthrough"
+    selected_mode = str(mode or "ask").strip().lower()
+
+    if selected_mode == "disable":
+        config.pop(binding_key, None)
+        save_config(config_path, config)
+        print("BigQuery passthrough: disabled")
+        return True
+
+    if selected_mode == "ask" and not interactive:
+        binding = get_google_bigquery_passthrough_binding()
+        if binding:
+            print(f"BigQuery passthrough: enabled with {binding['gcloud_account']}")
+        else:
+            print("BigQuery passthrough: disabled")
+            print("Enable later with: dekart init --bigquery-passthrough enable")
+        return True
+
+    if selected_mode == "ask":
+        print("BigQuery passthrough can use your local gcloud login.")
+        print("Dekart will send a short-lived cloud-platform token only to this Dekart endpoint.")
+        if not parse_yes_no_input(input("Enable BigQuery passthrough? [y/N]: "), default=False):
+            config.pop(binding_key, None)
+            save_config(config_path, config)
+            print("BigQuery passthrough: disabled")
+            return True
+
+    config.pop(binding_key, None)
+    save_config(config_path, config)
+
+    if shutil.which("gcloud") is None:
+        print("BigQuery passthrough setup failed: gcloud is not installed.", file=sys.stderr)
+        print("Install Google Cloud CLI, run `gcloud auth login`, then rerun `dekart init`.", file=sys.stderr)
+        return False
+
+    dekart_account = str(dekart_email or "").strip()
+    anonymous_self_hosted = dekart_account == "UNKNOWN_EMAIL"
+    if dekart_account.casefold().endswith(".gserviceaccount.com"):
+        print("BigQuery passthrough setup failed: Dekart is authenticated as a service account.", file=sys.stderr)
+        return False
+    account = dekart_account.casefold()
+    if anonymous_self_hosted:
+        try:
+            account_result = subprocess.run(
+                ["gcloud", "config", "get-value", "account", "--quiet"], check=False,
+                capture_output=True, text=True, timeout=15,
+            )
+            auth_result = subprocess.run(
+                ["gcloud", "auth", "list", "--format=value(account)"], check=False,
+                capture_output=True, text=True, timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            account_result = None
+            auth_result = None
+        if account_result is None or auth_result is None:
+            print("BigQuery passthrough setup failed: gcloud account lookup failed.", file=sys.stderr)
+            print("Run `gcloud auth login`, then rerun `dekart init`.", file=sys.stderr)
+            return False
+        active_account = (account_result.stdout or "").strip() if account_result.returncode == 0 else ""
+        authenticated_accounts = [
+            value.strip() for value in (auth_result.stdout or "").splitlines() if value.strip()
+        ]
+        user_accounts = [
+            value for value in authenticated_accounts
+            if not value.casefold().endswith(".gserviceaccount.com")
+        ]
+        account = next(
+            (value for value in user_accounts if value.casefold() == active_account.casefold()),
+            "",
+        )
+        if not account and len(user_accounts) == 1:
+            account = user_accounts[0]
+        elif not account and len(user_accounts) > 1 and interactive:
+            selection = select_menu_option(
+                title="Choose gcloud account for BigQuery passthrough",
+                options=user_accounts,
+                default_index=0,
+            )
+            if isinstance(selection, int):
+                account = user_accounts[selection]
+            elif selection is None:
+                for index, value in enumerate(user_accounts, start=1):
+                    print(f"  {index}) {value}")
+                choice = input(f"Choose [1-{len(user_accounts)}]: ").strip()
+                if choice.isdigit() and 1 <= int(choice) <= len(user_accounts):
+                    account = user_accounts[int(choice) - 1]
+        if auth_result.returncode != 0 or not account:
+            print("BigQuery passthrough setup failed: choose an authenticated gcloud user account.", file=sys.stderr)
+            print("Run `gcloud auth login`, then rerun `dekart init` interactively.", file=sys.stderr)
+            return False
+        print(f"Using authenticated gcloud account {account}; active account remains unchanged.")
+
+    try:
+        impersonation_result = subprocess.run(
+            ["gcloud", "config", "get-value", "auth/impersonate_service_account", "--quiet"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        impersonation_result = None
+    if impersonation_result is None:
+        print("BigQuery passthrough setup failed: gcloud configuration lookup failed.", file=sys.stderr)
+        return False
+    if impersonation_result.returncode != 0:
+        print("BigQuery passthrough setup failed: gcloud configuration lookup failed.", file=sys.stderr)
+        return False
+    impersonated_account = (impersonation_result.stdout or "").strip()
+    if impersonated_account not in {"", "(unset)"}:
+        print("BigQuery passthrough setup failed: gcloud service-account impersonation is enabled.", file=sys.stderr)
+        print("Unset auth/impersonate_service_account, then rerun `dekart init`.", file=sys.stderr)
+        return False
+    try:
+        mint_google_access_token(account, force_refresh=True)
+    except RuntimeError as exc:
+        print(f"BigQuery passthrough setup failed: {exc}", file=sys.stderr)
+        return False
+    _google_access_token_cache.clear()
+    config[binding_key] = {
+        "dekart_url": str(dekart_url).rstrip("/"),
+        "gcloud_account": account,
+    }
+    save_config(config_path, config)
+    print(f"BigQuery passthrough: enabled with {account}")
+    return True
+
+
 def _select_local_action(options, default_index=0):
     labels = [label for _action, label in options]
     cursor_selection = select_menu_option(
@@ -1467,7 +1740,7 @@ def prompt_local_dekart_url(docker_state="running"):
 
 def prompt_init_dekart_url():
     """Prompt user to select Dekart endpoint for init flow."""
-    print(ansi_rgb("[Step 1 of 3] Map backend", 112, 181, 208, bold=True))
+    print(ansi_rgb("[Step 1 of 4] Map backend", 112, 181, 208, bold=True))
     print("Dekart turns your SQL results into maps. Where should it run?")
     current_url = get_dekart_url().rstrip("/")
     default_index = 1
@@ -1758,23 +2031,38 @@ def mcp_call(name, args, timeout_seconds=30, return_metadata=False):
     """Call one MCP tool and return parsed response payload."""
     dekart_url = get_dekart_url().rstrip("/")
     endpoint = f"{dekart_url}/api/v1/mcp/call"
-    headers = {"Content-Type": "application/json"}
-    auth_headers = get_auth_headers()
-    if auth_headers:
-        headers.update(auth_headers)
-
     request_body = json.dumps({"name": name, "arguments": args}).encode("utf-8")
-    request = urllib.request.Request(url=endpoint, data=request_body, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-        body = response.read().decode("utf-8")
-        payload = json.loads(body) if body.strip() else {}
-        if not return_metadata:
-            return payload
-        return payload, {
-            "endpoint": endpoint,
-            "timeout_seconds": timeout_seconds,
-            "request_id": request_id_from_headers(response.headers),
-        }
+    for attempt in range(2):
+        headers = {"Content-Type": "application/json"}
+        auth_headers = get_auth_headers()
+        if auth_headers:
+            headers.update(auth_headers)
+        google_headers = get_optional_google_passthrough_headers(endpoint, force_refresh=attempt > 0)
+        headers.update(google_headers)
+        request = urllib.request.Request(url=endpoint, data=request_body, headers=headers, method="POST")
+        try:
+            response_context = (
+                urlopen_without_redirects(request, timeout_seconds)
+                if google_headers
+                else urllib.request.urlopen(request, timeout=timeout_seconds)
+            )
+            with response_context as response:
+                body = response.read().decode("utf-8")
+                payload = json.loads(body) if body.strip() else {}
+                if not return_metadata:
+                    return payload
+                return payload, {
+                    "endpoint": endpoint,
+                    "timeout_seconds": timeout_seconds,
+                    "request_id": request_id_from_headers(response.headers),
+                }
+        except urllib.error.HTTPError as exc:
+            _raw_body, parsed_body = parse_http_error_body(exc)
+            fields = extract_structured_error_fields(parsed_body)
+            if attempt == 0 and google_headers and fields.get("error") == "google_access_token_invalid":
+                exc.close()
+                continue
+            raise
 
 
 def parse_upload_start_payload(start_response_json, start_response_file):
@@ -2909,7 +3197,7 @@ def download_dataset_source(dataset_id, source_id, extension, output_path, timeo
         quote(source_id, safe=""),
         extension,
     )
-    body = download_binary(source_url, timeout_seconds=timeout_seconds)
+    body = download_binary(source_url, timeout_seconds=timeout_seconds, google_passthrough=True)
     return save_binary_file(output_path, body), len(body)
 
 
@@ -3355,7 +3643,7 @@ class LocalSetupError(Exception):
         self.exit_code = exit_code
 
 
-def handle_init(no_browser, local_snapshot_mode):
+def handle_init(no_browser, local_snapshot_mode, bigquery_passthrough_mode="ask"):
     """Run device authorization flow and save returned Dekart CLI token."""
     interactive = is_interactive_terminal()
     if interactive:
@@ -3374,7 +3662,7 @@ def handle_init(no_browser, local_snapshot_mode):
             save_dekart_url(dekart_url)
     else:
         dekart_url = get_dekart_url().rstrip("/")
-        print(ansi_rgb("[Step 1 of 3] Select Dekart endpoint", 112, 181, 208, bold=True))
+        print(ansi_rgb("[Step 1 of 4] Select Dekart endpoint", 112, 181, 208, bold=True))
         print(f"Using Dekart endpoint: {dekart_url}")
         print("Tip: change endpoint later with: dekart config --url <URL>")
         print()
@@ -3383,7 +3671,7 @@ def handle_init(no_browser, local_snapshot_mode):
     token_endpoint = f"{dekart_url}/api/v1/device/token"
     token_path = get_token_path()
 
-    print(ansi_rgb("[Step 2 of 3] Authorize this device", 112, 181, 208, bold=True))
+    print(ansi_rgb("[Step 2 of 4] Authorize this device", 112, 181, 208, bold=True))
     print("Registering device with Dekart...")
     try:
         start_payload = post_json(device_endpoint, {"device_name": build_device_name()})
@@ -3447,9 +3735,18 @@ def handle_init(no_browser, local_snapshot_mode):
             email = token_payload.get("email", "")
             print(f"Done. Authenticated as {email}")
             print(f"Token saved: {token_path}")
+            print()
+            print(ansi_rgb("[Step 3 of 4] BigQuery passthrough setup", 112, 181, 208, bold=True))
+            if not configure_google_bigquery_passthrough(
+                bigquery_passthrough_mode,
+                dekart_url,
+                email,
+                interactive,
+            ):
+                return 1
             mode = str(local_snapshot_mode or "ask").strip().lower()
             print()
-            print(ansi_rgb("[Step 3 of 3] Local snapshot setup", 112, 181, 208, bold=True))
+            print(ansi_rgb("[Step 4 of 4] Local snapshot setup", 112, 181, 208, bold=True))
             if mode == "install":
                 print("Installing local snapshot capability for best snapshot performance...")
                 install_result = install_local_snapshot_capability(
@@ -3505,6 +3802,7 @@ def handle_init(no_browser, local_snapshot_mode):
                 print("You can disable/uninstall with: dekart snapshot-local uninstall")
 
             local_snapshot_enabled = get_local_snapshot_settings(load_config(get_config_path())).get("enabled", False)
+            passthrough_binding = get_google_bigquery_passthrough_binding()
             print()
             print(ansi_rgb("Hey, success!", 112, 181, 208, bold=True))
             print("Setup summary:")
@@ -3512,6 +3810,11 @@ def handle_init(no_browser, local_snapshot_mode):
             print(f"  Account: {email}")
             print(f"  Config: {get_config_path()}")
             print(f"  Token: {token_path}")
+            print(
+                "  BigQuery passthrough: {0}".format(
+                    passthrough_binding["gcloud_account"] if passthrough_binding else "disabled"
+                )
+            )
             print(f"  Local snapshot: {'enabled' if local_snapshot_enabled else 'disabled'}")
             print("You can run `dekart init` again anytime.")
             return 0
@@ -3542,7 +3845,7 @@ def main():
     if args.command == "config":
         raise SystemExit(handle_config(args.url))
     if args.command == "init":
-        raise SystemExit(handle_init(args.no_browser, args.local_snapshot))
+        raise SystemExit(handle_init(args.no_browser, args.local_snapshot, args.bigquery_passthrough))
     if args.command == "local":
         raise SystemExit(
             local_docker.handle_local(

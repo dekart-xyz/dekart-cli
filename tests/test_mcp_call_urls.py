@@ -66,6 +66,7 @@ class ReportURLTest(unittest.TestCase):
 
 
 class MCPCallURLTest(unittest.TestCase):
+    @mock.patch.object(cli, "get_optional_google_passthrough_headers", return_value={})
     @mock.patch.object(cli, "get_auth_headers", return_value={})
     @mock.patch.object(cli, "get_dekart_url", return_value="http://localhost:8080")
     @mock.patch.object(
@@ -73,11 +74,14 @@ class MCPCallURLTest(unittest.TestCase):
         "urlopen",
         return_value=FakeResponse({"result": {"report": {"id": "report-1"}}}),
     )
-    def test_get_report_properties_returns_raw_payload(self, _urlopen, _get_dekart_url, _get_auth_headers):
+    def test_get_report_properties_returns_raw_payload(
+        self, _urlopen, _get_dekart_url, _get_auth_headers, _google_headers
+    ):
         payload = cli.mcp_call("get_report_properties", {"report_id": "report-1"})
 
         self.assertEqual(payload, {"result": {"report": {"id": "report-1"}}})
 
+    @mock.patch.object(cli, "get_optional_google_passthrough_headers", return_value={})
     @mock.patch.object(cli, "get_auth_headers", return_value={})
     @mock.patch.object(cli, "get_dekart_url", return_value="http://localhost:8080")
     @mock.patch.object(
@@ -85,7 +89,9 @@ class MCPCallURLTest(unittest.TestCase):
         "urlopen",
         return_value=FakeResponse({"result": {"report_path": "/reports/report-1"}}),
     )
-    def test_create_report_metadata_return_keeps_raw_payload(self, _urlopen, _get_dekart_url, _get_auth_headers):
+    def test_create_report_metadata_return_keeps_raw_payload(
+        self, _urlopen, _get_dekart_url, _get_auth_headers, _google_headers
+    ):
         payload, metadata = cli.mcp_call("create_report", {}, return_metadata=True)
 
         self.assertEqual(payload, {"result": {"report_path": "/reports/report-1"}})

@@ -34,6 +34,7 @@ class HandleInitUrlTest(unittest.TestCase):
             stack.enter_context(mock.patch("builtins.input", return_value="y"))
             save_dekart_url = stack.enter_context(mock.patch.object(cli, "save_dekart_url"))
             save_token = stack.enter_context(mock.patch.object(cli, "save_token"))
+            stack.enter_context(mock.patch.object(cli, "configure_google_bigquery_passthrough", return_value=True))
             stack.enter_context(mock.patch.object(cli, "get_token_path"))
             stack.enter_context(redirect_stdout(stdout))
             stack.enter_context(redirect_stderr(stderr))

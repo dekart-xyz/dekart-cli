@@ -409,7 +409,7 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(run.call_args.args[0], local_docker.docker_run_command(8081))
         self.assertTrue(run.call_args.kwargs["stream_output"])
 
-    def test_up_starts_stopped_managed_container(self):
+    def test_up_recreates_stopped_managed_container_to_pull_latest_image(self):
         stopped = local_docker._base_status("stopped", port=8080, managed=True)
         running = local_docker._base_status("running", port=8080, managed=True, healthy=True)
         container = {"managed": True, "running": False, "port": 8080}
@@ -417,13 +417,31 @@ class LifecycleTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(local_docker, "get_status", side_effect=[stopped, running]))
             stack.enter_context(mock.patch.object(local_docker, "inspect_container", return_value=container))
             stack.enter_context(mock.patch.object(local_docker, "is_port_free", return_value=True))
+            stack.enter_context(mock.patch.object(local_docker, "prepare_data_volume", return_value={"code": 0}))
             run = stack.enter_context(mock.patch.object(local_docker, "run_command", return_value=completed()))
             stack.enter_context(mock.patch.object(local_docker, "wait_for_dekart", return_value=True))
             executed = []
             result = local_docker.up(on_execute=executed.append)
         self.assertEqual(result["code"], 0)
-        run.assert_called_once_with(["docker", "start", "dekart-local"])
-        self.assertEqual(executed, ["docker start dekart-local"])
+        self.assertEqual(run.call_args_list[0].args[0], ["docker", "pull", local_docker.IMAGE])
+        self.assertEqual(run.call_args_list[1].args[0], ["docker", "rm", "dekart-local"])
+        self.assertEqual(run.call_args_list[2].args[0], local_docker.docker_run_command(8080))
+        self.assertTrue(run.call_args_list[2].kwargs["stream_output"])
+        self.assertEqual(executed, [
+            "docker pull dekartxyz/dekart:latest",
+            "docker rm dekart-local",
+            local_docker.format_command(local_docker.docker_run_command(8080)),
+        ])
+
+    def test_up_pull_failure_keeps_stopped_managed_container(self):
+        stopped = local_docker._base_status("stopped", port=8080, managed=True)
+        with mock.patch.object(local_docker, "get_status", return_value=stopped), mock.patch.object(
+            local_docker, "run_command", return_value=completed(1, stderr="network down")
+        ) as run:
+            result = local_docker.up()
+        self.assertEqual(result["code"], 1)
+        run.assert_called_once_with(["docker", "pull", local_docker.IMAGE], stream_output=True)
+        self.assertIn("Could not pull latest Dekart image", result["message"])
 
     def test_up_recreates_stopped_managed_container_on_new_port(self):
         stopped = local_docker._base_status("stopped", port=8080, managed=True)
@@ -439,9 +457,10 @@ class LifecycleTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(local_docker, "wait_for_dekart", return_value=True))
             result = local_docker.up()
         self.assertEqual(result["code"], 0)
-        self.assertEqual(run.call_args_list[0].args[0], ["docker", "rm", "dekart-local"])
-        self.assertIn("dekart-local-data:/dekart/data", run.call_args_list[1].args[0])
-        self.assertTrue(run.call_args_list[1].kwargs["stream_output"])
+        self.assertEqual(run.call_args_list[0].args[0], ["docker", "pull", local_docker.IMAGE])
+        self.assertEqual(run.call_args_list[1].args[0], ["docker", "rm", "dekart-local"])
+        self.assertIn("dekart-local-data:/dekart/data", run.call_args_list[2].args[0])
+        self.assertTrue(run.call_args_list[2].kwargs["stream_output"])
 
     def test_up_refuses_foreign_container(self):
         conflict = local_docker._base_status("ownership_conflict", port=8080)
@@ -458,7 +477,7 @@ class LifecycleTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(local_docker, "get_status", side_effect=[absent, unhealthy]))
             stack.enter_context(mock.patch.object(local_docker, "inspect_container", return_value=None))
             stack.enter_context(mock.patch.object(local_docker, "prepare_data_volume", return_value={"code": 0}))
-            stack.enter_context(mock.patch.object(local_docker, "run_command", side_effect=[completed(), completed(stdout="boot failed")]))
+            stack.enter_context(mock.patch.object(local_docker, "run_command", side_effect=[completed(), completed(), completed(stdout="boot failed")]))
             stack.enter_context(mock.patch.object(local_docker, "wait_for_dekart", return_value=False))
             result = local_docker.up(wait_timeout=1)
         self.assertEqual(result["code"], 1)

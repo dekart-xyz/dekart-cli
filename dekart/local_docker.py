@@ -391,27 +391,31 @@ def up(wait_timeout=STARTUP_TIMEOUT_SECONDS, preferred_port=None, reuse_external
             return {"code": 0, "message": "Dekart is running at {0}.".format(url), "status": get_status(), "command": format_command(["docker", "start", CONTAINER_NAME])}
         return _failure_with_logs("The running Dekart container did not become healthy within {0} seconds.".format(wait_timeout), port=status.get("port"))
 
+    # Pull before replacing a stopped container so a network failure leaves the old container recoverable.
+    pull = _run_mutation(["docker", "pull", IMAGE], on_execute=on_execute, stream_output=True)
+    if pull["code"] != 0:
+        detail = (pull["stderr"] or pull["stdout"]).strip()
+        return {"code": 1, "message": "Could not pull latest Dekart image: {0}".format(detail), "status": status}
+
     container = inspect_container()
     if container and container.get("managed"):
         port = container.get("port")
-        if port and is_port_free(port):
-            command = ["docker", "start", CONTAINER_NAME]
-            result = _run_mutation(command, on_execute=on_execute)
-        else:
+        if not port or not is_port_free(port):
             port = first_available_port()
             if port is None:
                 return {"code": 1, "message": "No free local port found in 8080-8099.", "status": status}
-            prepared = prepare_data_volume(
-                allow_legacy=VOLUME_NAME in container.get("volumes", []),
-                on_execute=on_execute,
-            )
-            if prepared["code"] != 0:
-                return {"code": prepared["code"], "message": prepared["message"], "status": status}
-            remove = _run_mutation(["docker", "rm", CONTAINER_NAME], on_execute=on_execute)
-            if remove["code"] != 0:
-                return {"code": 1, "message": "Could not recreate managed container: {0}".format(remove["stderr"].strip()), "status": status}
-            command = docker_run_command(port)
-            result = _run_mutation(command, on_execute=on_execute, stream_output=True)
+        # Recreate the stopped container so Docker refreshes the image while the data volume persists.
+        prepared = prepare_data_volume(
+            allow_legacy=VOLUME_NAME in container.get("volumes", []),
+            on_execute=on_execute,
+        )
+        if prepared["code"] != 0:
+            return {"code": prepared["code"], "message": prepared["message"], "status": status}
+        remove = _run_mutation(["docker", "rm", CONTAINER_NAME], on_execute=on_execute)
+        if remove["code"] != 0:
+            return {"code": 1, "message": "Could not recreate managed container: {0}".format(remove["stderr"].strip()), "status": status}
+        command = docker_run_command(port)
+        result = _run_mutation(command, on_execute=on_execute, stream_output=True)
     else:
         port = status.get("port") or first_available_port()
         if port is None:

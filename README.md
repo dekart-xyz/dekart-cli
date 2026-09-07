@@ -57,13 +57,14 @@ dekart local down
 dekart local remove
 ```
 
-The CLI uses a labeled container named `dekart-local` and a labeled persistent Docker volume named `dekart-local-data`. `down` stops the container without deleting the container or volume. `remove` asks for confirmation, then removes both the container and its data volume; use `remove --force` to skip confirmation. If port 8080 is occupied by another service, the CLI selects the first free port through 8099 and saves that URL before authorization begins.
+The CLI uses a labeled container named `dekart-local` and a labeled persistent Docker volume named `dekart-local-data`. `down` stops the container without deleting the container or volume. The next `up` recreates the container from the latest image while preserving the data volume. `remove` asks for confirmation, then removes both the container and its data volume; use `remove --force` to skip confirmation. If port 8080 is occupied by another service, the CLI selects the first free port through 8099 and saves that URL before authorization begins.
 
 When the CLI starts or stops Docker, it prints `Executing: <docker command>` before running it. You can also choose “I will start or connect to Dekart myself” during `dekart init`; the CLI prints a simple standalone `docker run` command without CLI labels, container names, or volumes, then asks for the Dekart URL.
 
-The initial Docker command is:
+The initial Docker commands are:
 
 ```bash
+docker pull dekartxyz/dekart:latest
 docker run -d \
   --name dekart-local \
   --label xyz.dekart.cli.managed=true \

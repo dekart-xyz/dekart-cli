@@ -20,9 +20,12 @@ dekart init
 `dekart init` walks you through:
 
 1. Picking the instance (Cloud / self-hosted / localhost).
-2. Authorizing the CLI in your browser.
-3. Optionally enabling BigQuery passthrough with your local `gcloud` user login.
-4. Optionally enabling local snapshots.
+2. Optionally enabling BigQuery passthrough with an authenticated local `gcloud` user.
+3. Installing Playwright and Chromium for local snapshots unless you pass `--local-snapshot skip`.
+4. Authorizing the CLI in your browser.
+
+The browser opens automatically as the final setup step. Pass `--no-browser` to
+print the authorization URL without opening it.
 
 To switch instance later:
 
@@ -33,10 +36,10 @@ dekart init
 
 Config and token: `~/.config/dekart/`.
 
-BigQuery passthrough requires the Google Cloud CLI. For signed-in Dekart users,
-the same user account must be authenticated in `gcloud`; anonymous self-hosted
-instances prompt you to choose an authenticated `gcloud` user account. The CLI
-stores only that account and the selected Dekart URL; it mints short-lived tokens
+BigQuery passthrough requires the Google Cloud CLI. The CLI prefers the active
+authenticated non-service-account `gcloud` user, uses the only available user,
+or asks you to choose when several are available. The `gcloud` and Dekart emails
+may differ. The CLI stores only that account and the selected Dekart URL; it mints short-lived tokens
 when needed and keeps them in process memory.
 Run `dekart init --bigquery-passthrough enable` to enable it later, or use
 `--bigquery-passthrough disable` to remove the local binding.

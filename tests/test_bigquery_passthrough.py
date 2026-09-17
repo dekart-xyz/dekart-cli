@@ -57,7 +57,11 @@ class BigQueryPassthroughConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.json"
             config_path.write_text('{"other": "kept"}\n', encoding="utf-8")
-            process_results = [mock.Mock(returncode=0, stdout="(unset)\n", stderr="")]
+            process_results = [
+                mock.Mock(returncode=0, stdout="user@example.com\n", stderr=""),
+                mock.Mock(returncode=0, stdout="user@example.com\n", stderr=""),
+                mock.Mock(returncode=0, stdout="(unset)\n", stderr=""),
+            ]
             with mock.patch.object(cli, "get_config_path", return_value=config_path), mock.patch.object(
                 cli.shutil, "which", return_value="/usr/bin/gcloud"
             ), mock.patch.object(cli.subprocess, "run", side_effect=process_results), mock.patch.object(
@@ -65,7 +69,7 @@ class BigQueryPassthroughConfigTest(unittest.TestCase):
             ):
                 self.assertTrue(
                     cli.configure_google_bigquery_passthrough(
-                        "enable", "https://dekart.example", "USER@example.com", False
+                        "enable", "https://dekart.example", False
                     )
                 )
 
@@ -87,7 +91,7 @@ class BigQueryPassthroughConfigTest(unittest.TestCase):
             with mock.patch.object(cli, "get_config_path", return_value=config_path):
                 self.assertTrue(
                     cli.configure_google_bigquery_passthrough(
-                        "disable", "https://dekart.example", "user@example.com", False
+                        "disable", "https://dekart.example", False
                     )
                 )
             self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), {"other": "kept"})
@@ -97,7 +101,13 @@ class BigQueryPassthroughConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             cli, "get_config_path", return_value=Path(directory) / "config.json"
         ), mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gcloud"), mock.patch.object(
-            cli.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="(unset)\n", stderr="")
+            cli.subprocess,
+            "run",
+            side_effect=[
+                mock.Mock(returncode=0, stdout="user@example.com\n", stderr=""),
+                mock.Mock(returncode=0, stdout="user@example.com\n", stderr=""),
+                mock.Mock(returncode=0, stdout="(unset)\n", stderr=""),
+            ],
         ), mock.patch.object(
             cli,
             "mint_google_access_token",
@@ -108,28 +118,34 @@ class BigQueryPassthroughConfigTest(unittest.TestCase):
         ), redirect_stderr(stderr):
             self.assertFalse(
                 cli.configure_google_bigquery_passthrough(
-                    "enable", "https://dekart.example", "user@example.com", False
+                    "enable", "https://dekart.example", False
                 )
             )
         self.assertIn("could not provide an access token", stderr.getvalue())
         self.assertIn("gcloud auth login --account user@example.com", stderr.getvalue())
 
-    def test_signed_in_dekart_account_is_passed_directly_to_gcloud(self):
+    def test_active_authenticated_user_is_selected_even_when_dekart_email_differs(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             cli, "get_config_path", return_value=Path(directory) / "config.json"
         ), mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gcloud"), mock.patch.object(
-            cli.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="(unset)\n", stderr="")
+            cli.subprocess,
+            "run",
+            side_effect=[
+                mock.Mock(returncode=0, stdout="gcloud-user@example.com\n", stderr=""),
+                mock.Mock(returncode=0, stdout="gcloud-user@example.com\nother@example.com\n", stderr=""),
+                mock.Mock(returncode=0, stdout="(unset)\n", stderr=""),
+            ],
         ), mock.patch.object(cli, "mint_google_access_token", return_value="secret-token") as mint:
             self.assertTrue(
                 cli.configure_google_bigquery_passthrough(
-                    "enable", "https://dekart.example", "user@example.com", False
+                    "enable", "https://dekart.example", False
                 )
             )
             saved = json.loads((Path(directory) / "config.json").read_text(encoding="utf-8"))
-        self.assertEqual(saved["google_bigquery_passthrough"]["gcloud_account"], "user@example.com")
-        mint.assert_called_once_with("user@example.com", force_refresh=True)
+        self.assertEqual(saved["google_bigquery_passthrough"]["gcloud_account"], "gcloud-user@example.com")
+        mint.assert_called_once_with("gcloud-user@example.com", force_refresh=True)
 
-    def test_anonymous_self_hosted_init_prompts_for_authenticated_user_account(self):
+    def test_service_account_active_falls_back_to_user_account_chooser(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             cli, "get_config_path", return_value=Path(directory) / "config.json"
         ), mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gcloud"), mock.patch.object(
@@ -149,12 +165,37 @@ class BigQueryPassthroughConfigTest(unittest.TestCase):
         ), mock.patch.object(cli, "mint_google_access_token", return_value="secret-token"):
             self.assertTrue(
                 cli.configure_google_bigquery_passthrough(
-                    "enable", "http://host.docker.internal:8080", "UNKNOWN_EMAIL", True
+                    "enable", "http://host.docker.internal:8080", True
                 )
             )
             saved = json.loads((Path(directory) / "config.json").read_text(encoding="utf-8"))
 
         self.assertEqual(saved["google_bigquery_passthrough"]["gcloud_account"], "second@example.com")
+
+    def test_service_account_active_falls_back_to_only_user_account(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            cli, "get_config_path", return_value=Path(directory) / "config.json"
+        ), mock.patch.object(cli.shutil, "which", return_value="/usr/bin/gcloud"), mock.patch.object(
+            cli.subprocess,
+            "run",
+            side_effect=[
+                mock.Mock(returncode=0, stdout="runner@example.iam.gserviceaccount.com\n", stderr=""),
+                mock.Mock(
+                    returncode=0,
+                    stdout="user@example.com\nrunner@example.iam.gserviceaccount.com\n",
+                    stderr="",
+                ),
+                mock.Mock(returncode=0, stdout="(unset)\n", stderr=""),
+            ],
+        ), mock.patch.object(cli, "mint_google_access_token", return_value="secret-token"):
+            self.assertTrue(
+                cli.configure_google_bigquery_passthrough(
+                    "enable", "https://dekart.example", False
+                )
+            )
+            saved = json.loads((Path(directory) / "config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["google_bigquery_passthrough"]["gcloud_account"], "user@example.com")
 
     def test_impersonation_lookup_failure_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
@@ -166,12 +207,12 @@ class BigQueryPassthroughConfigTest(unittest.TestCase):
         ), mock.patch.object(cli, "mint_google_access_token") as mint, redirect_stderr(io.StringIO()):
             self.assertFalse(
                 cli.configure_google_bigquery_passthrough(
-                    "enable", "https://dekart.example", "user@example.com", False
+                    "enable", "https://dekart.example", False
                 )
             )
         mint.assert_not_called()
 
-    def test_binding_requires_same_endpoint_and_device_email(self):
+    def test_binding_requires_same_endpoint_but_allows_mismatched_device_email(self):
         config = {
             "google_bigquery_passthrough": {
                 "dekart_url": "https://dekart.example",
@@ -188,6 +229,10 @@ class BigQueryPassthroughConfigTest(unittest.TestCase):
                 cli, "get_token_path", return_value=token_path
             ), mock.patch.object(cli, "get_dekart_url", return_value="https://dekart.example"):
                 self.assertEqual(cli.get_google_bigquery_passthrough_binding()["gcloud_account"], "user@example.com")
+            with mock.patch.object(cli, "load_config", return_value=config), mock.patch.object(
+                cli, "get_token_path", return_value=token_path
+            ), mock.patch.object(cli, "get_dekart_url", return_value="https://other.example"):
+                self.assertIsNone(cli.get_google_bigquery_passthrough_binding())
             token_path.write_text(
                 json.dumps({"dekart_url": "https://dekart.example", "email": "other@example.com"}),
                 encoding="utf-8",
@@ -195,7 +240,7 @@ class BigQueryPassthroughConfigTest(unittest.TestCase):
             with mock.patch.object(cli, "load_config", return_value=config), mock.patch.object(
                 cli, "get_token_path", return_value=token_path
             ), mock.patch.object(cli, "get_dekart_url", return_value="https://dekart.example"):
-                self.assertIsNone(cli.get_google_bigquery_passthrough_binding())
+                self.assertEqual(cli.get_google_bigquery_passthrough_binding()["gcloud_account"], "user@example.com")
 
     def test_binding_accepts_selected_gcloud_user_for_anonymous_self_hosted_identity(self):
         config = {

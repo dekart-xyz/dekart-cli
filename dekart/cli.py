@@ -52,7 +52,7 @@ def build_parser():
         "--local-snapshot",
         choices=("ask", "install", "skip"),
         default="ask",
-        help="After auth, ask/install/skip local headless snapshot capability (default: ask).",
+        help="Install or skip local headless snapshot capability (default: install automatically).",
     )
     init.add_argument(
         "--bigquery-passthrough",
@@ -657,7 +657,7 @@ class _RejectRedirects(urllib.request.HTTPRedirectHandler):
 
 
 def get_google_bigquery_passthrough_binding():
-    """Return the valid local gcloud binding for the current Dekart identity."""
+    """Return the endpoint-scoped local gcloud binding."""
     config = load_config(get_config_path())
     binding = config.get("google_bigquery_passthrough")
     if not isinstance(binding, dict):
@@ -668,9 +668,6 @@ def get_google_bigquery_passthrough_binding():
         return None
     token_payload = load_token(get_token_path())
     if str(token_payload.get("dekart_url", "")).strip().rstrip("/") != dekart_url:
-        return None
-    dekart_email = str(token_payload.get("email", "")).strip()
-    if dekart_email != "UNKNOWN_EMAIL" and dekart_email.casefold() != account.casefold():
         return None
     return {"dekart_url": dekart_url, "gcloud_account": account}
 
@@ -1489,7 +1486,7 @@ def save_dekart_url(url):
     save_config(config_path, config)
 
 
-def configure_google_bigquery_passthrough(mode, dekart_url, dekart_email, interactive):
+def configure_google_bigquery_passthrough(mode, dekart_url, interactive):
     """Configure the non-secret local gcloud binding created by dekart init."""
     config_path = get_config_path()
     config = load_config(config_path)
@@ -1528,62 +1525,49 @@ def configure_google_bigquery_passthrough(mode, dekart_url, dekart_email, intera
         print("Install Google Cloud CLI, run `gcloud auth login`, then rerun `dekart init`.", file=sys.stderr)
         return False
 
-    dekart_account = str(dekart_email or "").strip()
-    anonymous_self_hosted = dekart_account == "UNKNOWN_EMAIL"
-    if dekart_account.casefold().endswith(".gserviceaccount.com"):
-        print("BigQuery passthrough setup failed: Dekart is authenticated as a service account.", file=sys.stderr)
-        return False
-    account = dekart_account.casefold()
-    if anonymous_self_hosted:
-        try:
-            account_result = subprocess.run(
-                ["gcloud", "config", "get-value", "account", "--quiet"], check=False,
-                capture_output=True, text=True, timeout=15,
-            )
-            auth_result = subprocess.run(
-                ["gcloud", "auth", "list", "--format=value(account)"], check=False,
-                capture_output=True, text=True, timeout=15,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            account_result = None
-            auth_result = None
-        if account_result is None or auth_result is None:
-            print("BigQuery passthrough setup failed: gcloud account lookup failed.", file=sys.stderr)
-            print("Run `gcloud auth login`, then rerun `dekart init`.", file=sys.stderr)
-            return False
-        active_account = (account_result.stdout or "").strip() if account_result.returncode == 0 else ""
-        authenticated_accounts = [
-            value.strip() for value in (auth_result.stdout or "").splitlines() if value.strip()
-        ]
-        user_accounts = [
-            value for value in authenticated_accounts
-            if not value.casefold().endswith(".gserviceaccount.com")
-        ]
-        account = next(
-            (value for value in user_accounts if value.casefold() == active_account.casefold()),
-            "",
+    try:
+        account_result = subprocess.run(
+            ["gcloud", "config", "get-value", "account", "--quiet"], check=False,
+            capture_output=True, text=True, timeout=15,
         )
-        if not account and len(user_accounts) == 1:
-            account = user_accounts[0]
-        elif not account and len(user_accounts) > 1 and interactive:
-            selection = select_menu_option(
-                title="Choose gcloud account for BigQuery passthrough",
-                options=user_accounts,
-                default_index=0,
-            )
-            if isinstance(selection, int):
-                account = user_accounts[selection]
-            elif selection is None:
-                for index, value in enumerate(user_accounts, start=1):
-                    print(f"  {index}) {value}")
-                choice = input(f"Choose [1-{len(user_accounts)}]: ").strip()
-                if choice.isdigit() and 1 <= int(choice) <= len(user_accounts):
-                    account = user_accounts[int(choice) - 1]
-        if auth_result.returncode != 0 or not account:
-            print("BigQuery passthrough setup failed: choose an authenticated gcloud user account.", file=sys.stderr)
-            print("Run `gcloud auth login`, then rerun `dekart init` interactively.", file=sys.stderr)
-            return False
-        print(f"Using authenticated gcloud account {account}; active account remains unchanged.")
+        auth_result = subprocess.run(
+            ["gcloud", "auth", "list", "--format=value(account)"], check=False,
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        print("BigQuery passthrough setup failed: gcloud account lookup failed.", file=sys.stderr)
+        print("Run `gcloud auth login`, then rerun `dekart init`.", file=sys.stderr)
+        return False
+    active_account = (account_result.stdout or "").strip() if account_result.returncode == 0 else ""
+    user_accounts = [
+        account for value in (auth_result.stdout or "").splitlines()
+        if (account := value.strip()) and not account.casefold().endswith(".gserviceaccount.com")
+    ]
+    account = next(
+        (value for value in user_accounts if value.casefold() == active_account.casefold()),
+        "",
+    )
+    if not account and len(user_accounts) == 1:
+        account = user_accounts[0]
+    elif not account and len(user_accounts) > 1 and interactive:
+        selection = select_menu_option(
+            title="Choose gcloud account for BigQuery passthrough",
+            options=user_accounts,
+            default_index=0,
+        )
+        if isinstance(selection, int):
+            account = user_accounts[selection]
+        elif selection is None:
+            for index, value in enumerate(user_accounts, start=1):
+                print(f"  {index}) {value}")
+            choice = input(f"Choose [1-{len(user_accounts)}]: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(user_accounts):
+                account = user_accounts[int(choice) - 1]
+    if auth_result.returncode != 0 or not account:
+        print("BigQuery passthrough setup failed: choose an authenticated gcloud user account.", file=sys.stderr)
+        print("Run `gcloud auth login`, then rerun `dekart init` interactively.", file=sys.stderr)
+        return False
+    print(f"Using authenticated gcloud account {account}; active account remains unchanged.")
 
     try:
         impersonation_result = subprocess.run(
@@ -3658,8 +3642,6 @@ def handle_init(no_browser, local_snapshot_mode, bigquery_passthrough_mode="ask"
         if not selected_url:
             return 0
         dekart_url = selected_url.rstrip("/")
-        if dekart_url.startswith("http://localhost:"):
-            save_dekart_url(dekart_url)
     else:
         dekart_url = get_dekart_url().rstrip("/")
         print(ansi_rgb("[Step 1 of 4] Select Dekart endpoint", 112, 181, 208, bold=True))
@@ -3667,11 +3649,42 @@ def handle_init(no_browser, local_snapshot_mode, bigquery_passthrough_mode="ask"
         print("Tip: change endpoint later with: dekart config --url <URL>")
         print()
 
+    save_dekart_url(dekart_url)
+
+    print(ansi_rgb("[Step 2 of 4] BigQuery passthrough setup", 112, 181, 208, bold=True))
+    if not configure_google_bigquery_passthrough(
+        bigquery_passthrough_mode,
+        dekart_url,
+        interactive,
+    ):
+        print("Warning: continuing without BigQuery passthrough.", file=sys.stderr)
+
+    mode = str(local_snapshot_mode or "ask").strip().lower()
+    print()
+    print(ansi_rgb("[Step 3 of 4] Local snapshot setup", 112, 181, 208, bold=True))
+    if mode == "skip":
+        print("Skipped local snapshot install (--local-snapshot skip).")
+        print("You can enable later with: dekart snapshot-local install")
+        print("You can disable/uninstall with: dekart snapshot-local uninstall")
+    else:
+        print("Installing local snapshot capability for best snapshot performance...")
+        install_result = install_local_snapshot_capability(
+            debug=False,
+            interactive=interactive,
+        )
+        if install_result.get("ok"):
+            print(install_result.get("message", "Local snapshot capability installed."))
+            print("Manage later with: dekart snapshot-local status|install|uninstall")
+        else:
+            print(install_result.get("message", "Failed to install local snapshot capability."), file=sys.stderr)
+            print("Warning: continuing without local snapshots. Retry with `dekart snapshot-local install`.", file=sys.stderr)
+
     device_endpoint = f"{dekart_url}/api/v1/device"
     token_endpoint = f"{dekart_url}/api/v1/device/token"
     token_path = get_token_path()
 
-    print(ansi_rgb("[Step 2 of 4] Authorize this device", 112, 181, 208, bold=True))
+    print()
+    print(ansi_rgb("[Step 4 of 4] Authorize this device", 112, 181, 208, bold=True))
     print("Registering device with Dekart...")
     try:
         start_payload = post_json(device_endpoint, {"device_name": build_device_name()})
@@ -3696,21 +3709,14 @@ def handle_init(no_browser, local_snapshot_mode, bigquery_passthrough_mode="ask"
     print(f"  {auth_url}")
     if no_browser:
         print("Browser auto-open is disabled (--no-browser).")
-    elif interactive:
-        open_now = parse_yes_no_input(input("Open browser now? [y/N]: "), default=False)
-        if open_now:
-            print("Opening browser...")
-            try:
-                webbrowser.open(auth_url, new=2, autoraise=True)
-            except Exception:
-                print("Could not open browser automatically. Open the URL manually.", file=sys.stderr)
-                print("If browser does not open, open this link:", file=sys.stderr)
-                print(f"  {auth_url}", file=sys.stderr)
-        else:
-            print("Okay, open the link manually when ready.")
     else:
-        print("Non-interactive mode: browser was not opened automatically.")
-        print("Open the link manually to continue authorization.")
+        print("Opening browser...")
+        try:
+            webbrowser.open(auth_url, new=2, autoraise=True)
+        except Exception:
+            print("Could not open browser automatically. Open the URL manually.", file=sys.stderr)
+            print("If browser does not open, open this link:", file=sys.stderr)
+            print(f"  {auth_url}", file=sys.stderr)
 
     print(f"Waiting for authorization (poll every {interval}s, expires in {expires_in}s)...")
     deadline = time.monotonic() + expires_in
@@ -3730,76 +3736,10 @@ def handle_init(no_browser, local_snapshot_mode, bigquery_passthrough_mode="ask"
         status = str(token_payload.get("status", "")).strip()
         if status == "authorized" and token_payload.get("token"):
             print("Finalizing setup...")
-            save_dekart_url(dekart_url)
             save_token(token_path, dekart_url, token_payload)
             email = token_payload.get("email", "")
             print(f"Done. Authenticated as {email}")
             print(f"Token saved: {token_path}")
-            print()
-            print(ansi_rgb("[Step 3 of 4] BigQuery passthrough setup", 112, 181, 208, bold=True))
-            if not configure_google_bigquery_passthrough(
-                bigquery_passthrough_mode,
-                dekart_url,
-                email,
-                interactive,
-            ):
-                return 1
-            mode = str(local_snapshot_mode or "ask").strip().lower()
-            print()
-            print(ansi_rgb("[Step 4 of 4] Local snapshot setup", 112, 181, 208, bold=True))
-            if mode == "install":
-                print("Installing local snapshot capability for best snapshot performance...")
-                install_result = install_local_snapshot_capability(
-                    debug=False,
-                    interactive=interactive,
-                )
-                if install_result.get("ok"):
-                    print(install_result.get("message", "Local snapshot capability installed."))
-                    print("Manage later with: dekart snapshot-local status|install|uninstall")
-                else:
-                    print(install_result.get("message", "Failed to install local snapshot capability."), file=sys.stderr)
-                    print("You can retry later with `dekart snapshot-local install`.", file=sys.stderr)
-                    return 1
-            elif mode == "ask":
-                if interactive:
-                    print("Recommended: install local snapshot capability for best snapshot performance.")
-                    print("This helps large/complex maps render faster and avoids remote snapshot limits.")
-                    selection = select_menu_option(
-                        title="Choose local snapshot option",
-                        options=[
-                            "Install local snapshot now (recommended)",
-                            "Skip for now",
-                        ],
-                        default_index=0,
-                    )
-                    if selection is None:
-                        answer = input("Install now? [Y/n]: ")
-                        install_now = parse_yes_no_input(answer, default=True)
-                    else:
-                        install_now = selection == 0
-                    if install_now:
-                        print("Installing local snapshot capability...")
-                        install_result = install_local_snapshot_capability(
-                            debug=False,
-                            interactive=interactive,
-                        )
-                        if install_result.get("ok"):
-                            print(install_result.get("message", "Local snapshot capability installed."))
-                            print("Manage later with: dekart snapshot-local status|install|uninstall")
-                        else:
-                            print(install_result.get("message", "Failed to install local snapshot capability."), file=sys.stderr)
-                            print("You can retry later with `dekart snapshot-local install`.", file=sys.stderr)
-                    else:
-                        print("Skipped local snapshot install.")
-                        print("You can enable later with: dekart snapshot-local install")
-                        print("You can disable/uninstall with: dekart snapshot-local uninstall")
-                else:
-                    print("Tip: install local snapshot capability later with `dekart snapshot-local install`.")
-                    print("You can disable/uninstall with: dekart snapshot-local uninstall")
-            else:
-                print("Skipped local snapshot install (--local-snapshot skip).")
-                print("You can enable later with: dekart snapshot-local install")
-                print("You can disable/uninstall with: dekart snapshot-local uninstall")
 
             local_snapshot_enabled = get_local_snapshot_settings(load_config(get_config_path())).get("enabled", False)
             passthrough_binding = get_google_bigquery_passthrough_binding()

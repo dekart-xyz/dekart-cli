@@ -707,6 +707,7 @@ class InitIntegrationTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(cli, "print_init_banner"))
             stack.enter_context(mock.patch.object(cli, "prompt_init_dekart_url", return_value="http://localhost:8085"))
             save_url = stack.enter_context(mock.patch.object(cli, "save_dekart_url"))
+            stack.enter_context(mock.patch.object(cli, "configure_google_bigquery_passthrough", return_value=True))
             stack.enter_context(mock.patch.object(cli, "post_json", side_effect=RuntimeError("stop after selection")))
             stack.enter_context(redirect_stdout(stdout))
             stack.enter_context(redirect_stderr(io.StringIO()))

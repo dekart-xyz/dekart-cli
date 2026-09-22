@@ -304,6 +304,11 @@ def build_parser():
         help="Snapshot map longitude override. Must be used with --lat.",
     )
     snapshot.add_argument(
+        "--include-widgets",
+        action="store_true",
+        help="Render the charts pane; the default is map only.",
+    )
+    snapshot.add_argument(
         "--remote-only",
         action="store_true",
         help="Skip local rendering and use the remote snapshot endpoint when available.",
@@ -2921,7 +2926,20 @@ def print_local_snapshot_failure_guidance(error, snapshot_url, timeout_seconds):
             )
 
 
-def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_json, debug, zoom=None, lat=None, lon=None):
+def handle_snapshot(
+    report_id,
+    out,
+    timeout,
+    width,
+    height,
+    remote_only,
+    raw_json,
+    debug,
+    zoom=None,
+    lat=None,
+    lon=None,
+    include_widgets=False,
+):
     """Render report snapshot PNG locally when configured, else use remote endpoint."""
     timeout_seconds = parse_int(timeout, 90)
     if timeout_seconds <= 0:
@@ -2946,6 +2964,8 @@ def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_jso
 
     snapshot_args = {"report_id": report_id_value}
     snapshot_args.update(snapshot_viewport)
+    if include_widgets:
+        snapshot_args["include_widgets"] = True
 
     try:
         snapshot_payload = mcp_call("create_report_snapshot", snapshot_args, timeout_seconds=timeout_seconds)
@@ -2960,6 +2980,16 @@ def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_jso
                 print_snapshot_stderr(f"{key}: {value}")
         if raw_body and not fields:
             print_snapshot_stderr(f"response: {raw_body}")
+        # Older servers reject the opt-in field before snapshot rendering begins.
+        if (
+            include_widgets
+            and exc.code == 400
+            and "unknown field" in raw_body
+            and "include_widgets" in raw_body
+        ):
+            print_snapshot_stderr(
+                "The Dekart server does not support --include-widgets; upgrade it."
+            )
         return 1
     except Exception as exc:
         print_snapshot_stderr(f"Snapshot request failed: {exc}")
@@ -3081,6 +3111,7 @@ def handle_snapshot(report_id, out, timeout, width, height, remote_only, raw_jso
         "snapshot_url": snapshot_url,
         "snapshot_render_url": snapshot_render_url,
         "snapshot_viewport": snapshot_viewport,
+        "include_widgets": bool(include_widgets),
         "expires_in": expires_in,
         "local_enabled": local_enabled,
         "local_attempted": can_attempt_local,
@@ -3863,6 +3894,7 @@ def main():
                 zoom=args.zoom,
                 lat=args.lat,
                 lon=args.lon,
+                include_widgets=args.include_widgets,
             )
         )
     if args.command == "report-url":

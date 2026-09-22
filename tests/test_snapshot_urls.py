@@ -3,6 +3,7 @@ import json
 import sys
 import types
 import unittest
+import urllib.error
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -70,8 +71,10 @@ class HandleSnapshotUrlTest(unittest.TestCase):
         zoom=None,
         lat=None,
         lon=None,
+        include_widgets=False,
         render_result=PNG,
         render_side_effect=None,
+        mcp_side_effect=None,
         local_enabled=True,
         clock_value=100.0,
     ):
@@ -83,6 +86,7 @@ class HandleSnapshotUrlTest(unittest.TestCase):
                     cli,
                     "mcp_call",
                     return_value={"result": snapshot_result},
+                    side_effect=mcp_side_effect,
                 )
             )
             stack.enter_context(
@@ -134,6 +138,7 @@ class HandleSnapshotUrlTest(unittest.TestCase):
                 zoom=zoom,
                 lat=lat,
                 lon=lon,
+                include_widgets=include_widgets,
             )
         return {
             "status": status,
@@ -227,6 +232,92 @@ class HandleSnapshotUrlTest(unittest.TestCase):
             json.loads(result["stdout"])["snapshot_viewport"],
             {"zoom": 12.0, "lat": 52.52, "lon": 13.405},
         )
+        self.assertFalse(json.loads(result["stdout"])["include_widgets"])
+
+    def test_snapshot_include_widgets_is_sent_to_mcp_and_json(self):
+        result = self.run_snapshot(
+            {
+                "snapshot_render_url": (
+                    "/reports/report-1/snapshot?snapshot_token=abc&include_widgets=true"
+                ),
+            },
+            raw_json=True,
+            include_widgets=True,
+        )
+
+        self.assertEqual(result["status"], 0)
+        result["mcp"].assert_called_once_with(
+            "create_report_snapshot",
+            {"report_id": "report-1", "include_widgets": True},
+            timeout_seconds=90,
+        )
+        self.assertTrue(json.loads(result["stdout"])["include_widgets"])
+
+    def test_snapshot_omits_include_widgets_from_default_request(self):
+        result = self.run_snapshot(
+            {"snapshot_render_url": "/reports/report-1/snapshot?snapshot_token=abc"},
+            raw_json=True,
+        )
+
+        self.assertEqual(result["status"], 0)
+        result["mcp"].assert_called_once_with(
+            "create_report_snapshot",
+            {"report_id": "report-1"},
+            timeout_seconds=90,
+        )
+        self.assertFalse(json.loads(result["stdout"])["include_widgets"])
+
+    def test_old_server_include_widgets_error_prints_upgrade_hint(self):
+        error = urllib.error.HTTPError(
+            "http://localhost:8080/api/v1/mcp/call",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'proto: (line 1:40): unknown field "include_widgets"'),
+        )
+
+        result = self.run_snapshot(
+            {},
+            include_widgets=True,
+            mcp_side_effect=error,
+        )
+        error.close()
+
+        self.assertEqual(result["status"], 1)
+        self.assertIn("Snapshot request failed (400): Bad Request", result["stderr"])
+        self.assertIn(
+            'response: proto: (line 1:40): unknown field "include_widgets"',
+            result["stderr"],
+        )
+        self.assertIn(
+            "The Dekart server does not support --include-widgets; upgrade it.",
+            result["stderr"],
+        )
+
+    def test_include_widgets_upgrade_hint_is_specific_to_matching_request_error(self):
+        cases = (
+            (True, b"invalid report id"),
+            (False, b'proto: unknown field "include_widgets"'),
+        )
+        for include_widgets, body in cases:
+            with self.subTest(include_widgets=include_widgets, body=body):
+                error = urllib.error.HTTPError(
+                    "http://localhost:8080/api/v1/mcp/call",
+                    400,
+                    "Bad Request",
+                    {},
+                    io.BytesIO(body),
+                )
+
+                result = self.run_snapshot(
+                    {},
+                    include_widgets=include_widgets,
+                    mcp_side_effect=error,
+                )
+                error.close()
+
+                self.assertEqual(result["status"], 1)
+                self.assertNotIn("does not support --include-widgets", result["stderr"])
 
     def test_snapshot_rejects_lat_without_lon(self):
         result = self.run_snapshot(
@@ -570,6 +661,34 @@ class SnapshotParserTest(unittest.TestCase):
         self.assertEqual(args.zoom, 12.0)
         self.assertEqual(args.lat, 52.52)
         self.assertEqual(args.lon, 13.405)
+
+    def test_snapshot_parses_include_widgets_on_and_off(self):
+        parser = cli.build_parser()
+
+        enabled = parser.parse_args(
+            ["snapshot", "--report-id", "report-1", "--include-widgets"]
+        )
+        disabled = parser.parse_args(["snapshot", "--report-id", "report-1"])
+
+        self.assertTrue(enabled.include_widgets)
+        self.assertFalse(disabled.include_widgets)
+
+    def test_main_passes_include_widgets_to_snapshot_handler(self):
+        argv = [
+            "dekart",
+            "snapshot",
+            "--report-id",
+            "report-1",
+            "--include-widgets",
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            cli, "send_version_ping"
+        ), mock.patch.object(cli, "handle_snapshot", return_value=0) as handler:
+            with self.assertRaises(SystemExit) as raised:
+                cli.main()
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertTrue(handler.call_args.kwargs["include_widgets"])
 
 
 if __name__ == "__main__":

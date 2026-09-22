@@ -105,6 +105,12 @@ dekart snapshot --report-id <id> --zoom 12 --lat 52.52 --lon 13.405 --out ./snap
 
 `--zoom` accepts `0` through `24`. Use `--lat` and `--lon` together.
 
+Include the charts pane when the report has widgets. A wider viewport leaves more room for the map:
+
+```bash
+dekart snapshot --report-id <id> --include-widgets --width 1920 --out ./snap-with-charts.png
+```
+
 When the server provides a verified render-URL lifetime and an established local
 page or browser target closes unexpectedly, the CLI retries once with a fresh
 browser and the same per-operation timeout. Browser launch failures and normal

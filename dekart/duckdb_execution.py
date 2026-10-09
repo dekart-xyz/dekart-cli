@@ -56,13 +56,15 @@ def validate_prepared_execution(result):
     duckdb_version = str(execution.get("duckdb_version", "")).strip()
     if not duckdb_version:
         raise ValueError("duckdb_execution.duckdb_version is missing.")
-    sources = execution.get("sources")
+    # Proto JSON omits empty repeated fields on source-free programs.
+    sources = execution.get("sources", [])
     statements = execution.get("statements")
     if not isinstance(sources, list):
         raise ValueError("duckdb_execution.sources must be an array.")
     if not isinstance(statements, list) or not statements:
         raise ValueError("duckdb_execution.statements must be a non-empty array.")
     extension_requirements(execution)
+    execution["sources"] = sources
 
     dataset_ids = set()
     for index, source in enumerate(sources):
@@ -77,7 +79,7 @@ def validate_prepared_execution(result):
             for field in ("file_source_id", "query_job_id")
             if str(source.get(field, "")).strip()
         ]
-        if len(revisions) != 1:
+        if len(revisions) != 1 or source.get("http_source_id"):
             raise ValueError("duckdb_execution.sources[{0}] must contain exactly one revision.".format(index))
         extension = str(source.get("extension", "")).strip().lower()
         if extension not in SUPPORTED_SOURCE_EXTENSIONS:
@@ -89,6 +91,21 @@ def validate_prepared_execution(result):
         parameters = statement.get("parameters", [])
         if not isinstance(parameters, list) or any(not isinstance(value, str) for value in parameters):
             raise ValueError("duckdb_execution.statements[{0}].parameters is invalid.".format(index))
+        http_sources = statement.get("http_sources", [])
+        if not isinstance(http_sources, list):
+            raise ValueError("Statement http_sources must be an array.")
+        for source in http_sources:
+            if not isinstance(source, dict):
+                raise ValueError("Statement HTTP source is invalid.")
+            for field in ("dataset_id", "http_source_id", "file_name"):
+                if not isinstance(source.get(field), str) or not source[field].strip():
+                    raise ValueError("Statement HTTP source {0} is missing.".format(field))
+            if source.get("file_source_id") or source.get("query_job_id"):
+                raise ValueError("Statement HTTP source must contain only an HTTP revision.")
+            if source.get("extension") not in SUPPORTED_SOURCE_EXTENSIONS:
+                raise ValueError("Statement HTTP source extension is unsupported; update the Dekart CLI.")
+            if not isinstance(source.get("url_sql", ""), str):
+                raise ValueError("Statement HTTP source url_sql must be a string.")
     return query_job, execution
 
 
@@ -154,7 +171,7 @@ def load_extensions(connection, requirements):
             ) from exc
 
 
-def execute_program(execution, query_job, source_paths, result_path, work_dir):
+def execute_program(execution, query_job, source_paths, result_path, work_dir, download_http_source):
     """Execute opaque prepared statements once and publish the root as Parquet."""
     if sys.version_info < (3, 9):
         raise RuntimeError("DuckDB query execution requires Python 3.9 or newer.")
@@ -187,7 +204,26 @@ def execute_program(execution, query_job, source_paths, result_path, work_dir):
         connection.execute("SET VARIABLE dekart_result_path = ?", [str(result_path)])
         connection.execute("SET lock_configuration=true")
 
+        source_index = len(source_paths)
         for index, statement in enumerate(execution["statements"]):
+            # URL queries may read views and parameters created by earlier statements.
+            for source in statement.get("http_sources", []):
+                resolved_url = None
+                if source.get("url_sql"):
+                    rows = connection.execute(source["url_sql"]).fetchall()
+                    if (len(rows) != 1 or len(rows[0]) != 1
+                            or not isinstance(rows[0][0], str) or not rows[0][0].strip()):
+                        raise RuntimeError(
+                            "HTTP source URL query returned {0} rows; exactly one non-empty URL is required."
+                            .format(len(rows))
+                        )
+                    resolved_url = rows[0][0]
+                path = download_http_source(source, source_index, resolved_url)
+                connection.execute(
+                    "SET VARIABLE dekart_source_{0}_path = ?".format(source_index),
+                    [str(Path(path).resolve())],
+                )
+                source_index += 1
             try:
                 connection.execute(statement["sql"], statement.get("parameters", []))
             except Exception as exc:

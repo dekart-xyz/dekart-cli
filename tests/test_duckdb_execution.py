@@ -124,6 +124,33 @@ class ParamsAndCapabilityTest(unittest.TestCase):
         error.close()
 
 
+class HTTPRequestsTest(unittest.TestCase):
+    def test_mcp_and_download_identify_cli(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{}'
+        with mock.patch.object(cli, "get_dekart_url", return_value="http://localhost:8080"), mock.patch.object(
+            cli, "get_installed_version", return_value="0.22.0"
+        ), mock.patch.object(cli, "get_auth_headers", return_value={"Authorization": "Bearer device"}), mock.patch.object(
+            cli, "get_optional_google_passthrough_headers", return_value={}
+        ), mock.patch.object(cli.urllib.request, "urlopen", return_value=response) as request:
+            cli.mcp_call("list_connections", {})
+            self.assertEqual(request.call_args.args[0].get_header("User-agent"), "dekart-cli/0.22.0")
+            cli.download_binary("http://localhost:8080/api/v1/dataset-source/d/s.csv")
+            self.assertEqual(request.call_args.args[0].get_header("User-agent"), "dekart-cli/0.22.0")
+            self.assertEqual(request.call_args.args[0].get_header("Authorization"), "Bearer device")
+
+    def test_computed_url_is_encoded_as_one_parameter(self):
+        from urllib.parse import parse_qs, urlsplit
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            cli, "get_dekart_url", return_value="http://localhost:8080"
+        ), mock.patch.object(cli, "download_binary", return_value=b"csv") as download:
+            cli.download_dataset_source("d", "s", "csv", Path(directory) / "http.csv.gz",
+                                        url="https://example.com/a.csv?station=A&B=2")
+        self.assertEqual(parse_qs(urlsplit(download.call_args.args[0]).query),
+                         {"url": ["https://example.com/a.csv?station=A&B=2"]})
+
+
 class PreparedExecutionValidationTest(unittest.TestCase):
     def test_valid_bundle(self):
         query_job, execution = duckdb_execution.validate_prepared_execution(prepared_result())
@@ -134,6 +161,12 @@ class PreparedExecutionValidationTest(unittest.TestCase):
         result = prepared_result()
         result["duckdb_execution"]["sources"] = []
         duckdb_execution.validate_prepared_execution(result)
+
+    def test_omitted_empty_sources_are_valid(self):
+        result = prepared_result()
+        result["duckdb_execution"].pop("sources")
+        _job, execution = duckdb_execution.validate_prepared_execution(result)
+        self.assertEqual(execution["sources"], [])
 
     def test_invalid_bundles(self):
         cases = []
@@ -158,6 +191,24 @@ class PreparedExecutionValidationTest(unittest.TestCase):
         unsupported_repository = prepared_result()
         unsupported_repository["duckdb_execution"]["extensions"][0]["repository"] = "CUSTOM"
         cases.append(unsupported_repository)
+        top_http = prepared_result()
+        top_http["duckdb_execution"]["sources"][0]["http_source_id"] = "http-1"
+        cases.append(top_http)
+        for url_sql in (None, "SELECT 'https://example.com/a.csv'"):
+            result = prepared_result()
+            source = {"dataset_id": "http-dataset", "http_source_id": "http-1",
+                      "extension": "csv", "file_name": "dekart_internal/http_123.csv.gz"}
+            if url_sql is not None:
+                source["url_sql"] = url_sql
+            result["duckdb_execution"]["statements"][0]["http_sources"] = [source]
+            duckdb_execution.validate_prepared_execution(result)
+            source.pop("file_name")
+            cases.append(result)
+        non_string = prepared_result()
+        non_string["duckdb_execution"]["statements"][0]["http_sources"] = [
+            {"dataset_id": "http-dataset", "http_source_id": "http-1", "extension": "csv",
+             "file_name": "a.csv", "url_sql": 42}]
+        cases.append(non_string)
         for result in cases:
             with self.subTest(result=result):
                 with self.assertRaises(ValueError):
@@ -250,7 +301,7 @@ class SourceResolutionTest(unittest.TestCase):
             "duckdb_execution": result["duckdb_execution"],
         }
 
-        def fake_execute(_execution, _job, source_paths, result_path, _work_dir):
+        def fake_execute(_execution, _job, source_paths, result_path, _work_dir, _download_http_source):
             self.assertTrue(Path(source_paths[0]).exists())
             Path(result_path).write_bytes(b"PAR1")
 

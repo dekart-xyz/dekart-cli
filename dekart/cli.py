@@ -569,7 +569,7 @@ def post_json(url, payload, timeout_seconds=15):
     request = urllib.request.Request(
         url=url,
         data=request_body,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "User-Agent": f"dekart-cli/{get_installed_version()}"},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
@@ -583,7 +583,7 @@ def read_json(url, headers=None, timeout_seconds=15):
     """Send JSON GET request and return decoded JSON response."""
     request = urllib.request.Request(
         url=url,
-        headers=headers or {},
+        headers={**(headers or {}), "User-Agent": f"dekart-cli/{get_installed_version()}"},
         method="GET",
     )
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
@@ -1295,7 +1295,7 @@ def uninstall_local_snapshot_capability(purge=False):
 def download_binary(url, timeout_seconds=30, google_passthrough=False):
     """Download binary payload from URL with optional auth headers."""
     for attempt in range(2):
-        headers = {}
+        headers = {"User-Agent": f"dekart-cli/{get_installed_version()}"}
         auth_headers = get_auth_headers()
         if auth_headers:
             headers.update(auth_headers)
@@ -2022,7 +2022,7 @@ def mcp_call(name, args, timeout_seconds=30, return_metadata=False):
     endpoint = f"{dekart_url}/api/v1/mcp/call"
     request_body = json.dumps({"name": name, "arguments": args}).encode("utf-8")
     for attempt in range(2):
-        headers = {"Content-Type": "application/json"}
+        headers = {"Content-Type": "application/json", "User-Agent": f"dekart-cli/{get_installed_version()}"}
         auth_headers = get_auth_headers()
         if auth_headers:
             headers.update(auth_headers)
@@ -2080,7 +2080,8 @@ def parse_upload_start_payload(start_response_json, start_response_file):
 
 def upload_part_binary(put_url, body_bytes, required_headers):
     """Upload one multipart chunk to Dekart part endpoint and return JSON manifest item."""
-    headers = {"Content-Type": "application/octet-stream", "Content-Length": str(len(body_bytes))}
+    headers = {"Content-Type": "application/octet-stream", "Content-Length": str(len(body_bytes)),
+               "User-Agent": f"dekart-cli/{get_installed_version()}"}
     auth_headers = get_auth_headers()
     if auth_headers:
         headers.update(auth_headers)
@@ -3203,7 +3204,7 @@ def download_query_job_result(job_id_value, query_job, out, timeout_seconds=60):
     }
 
 
-def download_dataset_source(dataset_id, source_id, extension, output_path, timeout_seconds=60):
+def download_dataset_source(dataset_id, source_id, extension, output_path, timeout_seconds=60, url=None):
     """Download one authenticated dataset source to a local path."""
     dekart_url = get_dekart_url().rstrip("/")
     source_url = "{0}/api/v1/dataset-source/{1}/{2}.{3}".format(
@@ -3212,6 +3213,9 @@ def download_dataset_source(dataset_id, source_id, extension, output_path, timeo
         quote(source_id, safe=""),
         extension,
     )
+    # Computed URLs are checked against the recorded template by the server.
+    if url is not None:
+        source_url += "?" + urlencode({"url": url})
     body = download_binary(source_url, timeout_seconds=timeout_seconds, google_passthrough=True)
     return save_binary_file(output_path, body), len(body)
 
@@ -3405,6 +3409,19 @@ def materialize_duckdb_query(metadata, out_dir, wait, timeout_seconds, interval_
             download_prepared_source(source, index, ready_jobs, directory)
             for index, source in enumerate(metadata["duckdb_execution"]["sources"])
         ]
+        # Keep the recorded suffix, including gzip, for DuckDB format detection.
+        def download_http_source(source, index, resolved_url):
+            source_path = Path(directory) / Path(source["file_name"]).name
+            try:
+                download_dataset_source(
+                    source["dataset_id"], source["http_source_id"], source["extension"],
+                    source_path, timeout_seconds=timeout_seconds, url=resolved_url,
+                )
+            except urllib.error.HTTPError as exc:
+                message, _payload = parse_http_error_body(exc)
+                raise RuntimeError(message) from exc
+            return source_path
+
         temporary_result = Path(directory) / "dekart_result.parquet"
         duckdb_execution.execute_program(
             metadata["duckdb_execution"],
@@ -3412,6 +3429,7 @@ def materialize_duckdb_query(metadata, out_dir, wait, timeout_seconds, interval_
             source_paths,
             temporary_result,
             directory,
+            download_http_source,
         )
         shutil.move(str(temporary_result), str(output_path))
     return {

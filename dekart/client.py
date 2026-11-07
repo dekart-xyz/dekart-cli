@@ -73,8 +73,9 @@ class DekartClient:
                     if _deadline is None:
                         return response.read(), response.headers
                     chunks = []
-                    while True:
-                        _deadline.remaining()
+                    while not response.isclosed():
+                        # urllib keeps the original socket timeout across reads.
+                        response.fp.raw._sock.settimeout(_deadline.remaining())
                         chunk = response.read1(64 * 1024)
                         _deadline.remaining()
                         if not chunk:

@@ -1,11 +1,12 @@
 import io
-import json
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 from pathlib import Path
 from unittest import mock
 
@@ -79,7 +80,6 @@ assert 'dekart.cli' not in __import__('sys').modules
         ping.assert_not_called()
 
     def test_mcp_extra_is_excluded_on_python_38(self):
-        import re
         config = (Path(__file__).parents[1] / 'pyproject.toml').read_text()
         extra = config.split('[project.optional-dependencies]')[1].split('[project.scripts]')[0]
         self.assertRegex(extra, r"mcp = \[.*mcp.*python_version >= '3\.10'")
@@ -130,6 +130,69 @@ class DuckDBLimitsTest(unittest.TestCase):
                     directory, True, 30, 1, duckdb_timeout_seconds=0.1)
             self.assertEqual(list(Path(directory).iterdir()), [])
         self.assertLess(time.monotonic() - started, 3)
+
+    def test_successful_download_with_deadline(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Length', '2')
+                self.end_headers()
+                self.wfile.write(b'ok')
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        c = client.DekartClient('http://127.0.0.1:{0}'.format(server.server_port), '')
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                path, size = client._download_dataset_source(c, 'dataset', 'source', 'csv',
+                    Path(directory) / 'source.csv', _deadline=duckdb_execution._Deadline(1))
+                self.assertEqual(size, 2)
+                self.assertEqual(path.read_bytes(), b'ok')
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_slow_download_is_stopped_at_total_deadline(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header('Content-Length', '100')
+                self.end_headers()
+                time.sleep(0.18)
+                try:
+                    self.wfile.write(b'a')
+                    self.wfile.flush()
+                    time.sleep(0.5)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        c = client.DekartClient('http://127.0.0.1:{0}'.format(server.server_port), '')
+        metadata = self.metadata('SELECT 1')
+        metadata['duckdb_execution']['sources'] = [
+            {'dataset_id': 'data', 'file_source_id': 'file', 'extension': 'csv'},
+        ]
+        try:
+            started = time.monotonic()
+            with tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(TimeoutError, 'duckdb_timeout_seconds'):
+                    client.materialize_duckdb_query(c, metadata, directory, True, 30, 1, duckdb_timeout_seconds=0.3)
+                self.assertEqual(list(Path(directory).iterdir()), [])
+            self.assertLess(time.monotonic() - started, 0.43)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     def test_downloads_share_execution_deadline(self):
         metadata = self.metadata('SELECT 1')

@@ -133,7 +133,7 @@ class HTTPRequestsTest(unittest.TestCase):
         response.__enter__.return_value = response
         response.read.return_value = b'{}'
         with mock.patch.object(cli, "get_dekart_url", return_value="http://localhost:8080"), mock.patch.object(
-            cli, "get_installed_version", return_value="0.22.0"
+            operations.metadata, "version", return_value="0.22.0"
         ), mock.patch.object(cli, "get_auth_headers", return_value={"Authorization": "Bearer device"}), mock.patch.object(
             cli, "get_optional_google_passthrough_headers", return_value={}
         ), mock.patch.object(cli.urllib.request, "urlopen", return_value=response) as request:

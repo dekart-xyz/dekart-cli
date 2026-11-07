@@ -2836,7 +2836,15 @@ def main():
     if args.command == "mcp" and args.mcp_command == "serve":
         if sys.version_info < (3, 10):
             parser.exit(2, "dekart mcp serve needs Python 3.10 or newer.\n")
-        parser.exit(2, "The MCP server is not available in this release.\n")
+        try:
+            from dekart.mcp_server import serve
+        except ImportError:
+            parser.exit(2, 'Install MCP support with pip install "dekart[mcp]".\n')
+        try:
+            serve(args.host, args.port)
+        except ValueError as exc:
+            parser.exit(2, str(exc) + "\n")
+        return
     send_version_ping()
 
     if args.command == "config":

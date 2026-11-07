@@ -10,6 +10,8 @@ Works with any Dekart instance:
 - **Local (Docker)** (on your machine with persistent local data)
 - **Self-hosted** (your own URL)
 
+For authenticated Streamable HTTP tools, see the [GeoSQL MCP server guide](docs/mcp-server.md).
+
 ## Init
 
 ```bash

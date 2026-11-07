@@ -1,0 +1,42 @@
+{
+  "manifest_version": "0.3",
+  "name": "geosql",
+  "display_name": "GeoSQL",
+  "version": "1.0.0",
+  "description": "Query and map your Dekart workspace with GeoSQL.",
+  "author": { "name": "Dekart XYZ", "url": "https://dekart.xyz" },
+  "license": "MIT",
+  "server": {
+    "type": "node",
+    "entry_point": "server.cjs",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server.cjs"],
+      "env": {
+        "GEOSQL_MCP_URL": "${user_config.url}",
+        "GEOSQL_MCP_TOKEN": "${user_config.token}"
+      }
+    }
+  },
+  "tools_generated": true,
+  "compatibility": {
+    "platforms": ["darwin", "win32"],
+    "runtimes": { "node": ">=18.0.0" }
+  },
+  "user_config": {
+    "url": {
+      "type": "string",
+      "title": "MCP Server URL",
+      "description": "Your GeoSQL MCP endpoint, including /mcp.",
+      "default": "https://geosql.dekart.xyz/mcp",
+      "required": true
+    },
+    "token": {
+      "type": "string",
+      "title": "Dekart token",
+      "description": "Create a token in Dekart workspace settings and paste it here.",
+      "sensitive": true,
+      "required": true
+    }
+  }
+}

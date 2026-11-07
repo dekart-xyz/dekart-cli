@@ -1,3 +1,6 @@
+import math
+import threading
+import time
 import re
 import sys
 from pathlib import Path
@@ -171,7 +174,23 @@ def load_extensions(connection, requirements):
             ) from exc
 
 
-def execute_program(execution, query_job, source_paths, result_path, work_dir, download_http_source):
+class _Deadline:
+    def __init__(self, seconds):
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError("duckdb_timeout_seconds must be a positive finite number.")
+        self.expires_at = time.monotonic() + seconds
+
+    def remaining(self):
+        remaining = self.expires_at - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                "DuckDB query timed out. This query also runs in users' browsers; "
+                "simplify it or pass a larger duckdb_timeout_seconds."
+            )
+        return remaining
+
+
+def execute_program(execution, query_job, source_paths, result_path, work_dir, download_http_source, memory_limit=None, _deadline=None):
     """Execute opaque prepared statements once and publish the root as Parquet."""
     if sys.version_info < (3, 9):
         raise RuntimeError("DuckDB query execution requires Python 3.9 or newer.")
@@ -188,7 +207,14 @@ def execute_program(execution, query_job, source_paths, result_path, work_dir, d
         str(work_path / "execution.duckdb"),
         config={"allow_unsigned_extensions": "false"},
     )
+    timer = None
     try:
+        if _deadline is not None:
+            timer = threading.Timer(_deadline.remaining(), connection.interrupt)
+            timer.daemon = True
+            timer.start()
+        if memory_limit is not None:
+            connection.execute("SET memory_limit = ?", [memory_limit])
         connection.execute("SET autoinstall_known_extensions=false")
         connection.execute("SET autoload_known_extensions=false")
         load_extensions(connection, extensions)
@@ -206,6 +232,8 @@ def execute_program(execution, query_job, source_paths, result_path, work_dir, d
 
         source_index = len(source_paths)
         for index, statement in enumerate(execution["statements"]):
+            if _deadline is not None:
+                _deadline.remaining()
             # URL queries may read views and parameters created by earlier statements.
             for source in statement.get("http_sources", []):
                 resolved_url = None
@@ -235,5 +263,14 @@ def execute_program(execution, query_job, source_paths, result_path, work_dir, d
             "COPY ({0}) TO (getvariable('dekart_result_path')) (FORMAT PARQUET)".format(projection)
         )
         connection.execute("SELECT * FROM read_parquet(?) LIMIT 0", [str(result_path)])
+        if _deadline is not None:
+            _deadline.remaining()
+    except Exception:
+        if _deadline is not None:
+            _deadline.remaining()
+        raise
     finally:
+        if timer is not None:
+            timer.cancel()
+            timer.join()
         connection.close()

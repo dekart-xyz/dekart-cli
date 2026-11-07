@@ -8,6 +8,9 @@ from pathlib import Path
 from unittest import mock
 
 from dekart import cli
+from dekart import client as operations
+
+client = operations.DekartClient("http://localhost:8080", "device")
 from dekart import duckdb_execution
 
 
@@ -57,10 +60,10 @@ class ParamsAndCapabilityTest(unittest.TestCase):
 
     def test_run_query_uses_discovered_opt_in_and_params(self):
         response = {"result": {"query_job": {"id": "job-1"}}}
-        with mock.patch.object(cli, "supports_duckdb_execution", return_value=True), mock.patch.object(
-            cli, "mcp_call", return_value=response
+        with mock.patch.object(operations, "supports_duckdb_execution", return_value=True), mock.patch.object(
+            client, "call", return_value=response
         ) as call:
-            result = cli.run_prepared_query("query-1", "qp_limit=2", 30)
+            result = operations.run_prepared_query(client, "query-1", "qp_limit=2", 30)
 
         self.assertEqual(result["job_id"], "job-1")
         call.assert_called_once_with(
@@ -75,43 +78,43 @@ class ParamsAndCapabilityTest(unittest.TestCase):
 
     def test_old_server_connection_call_omits_opt_in(self):
         response = {"result": {"query_job": {"id": "job-1"}}}
-        with mock.patch.object(cli, "supports_duckdb_execution", return_value=False), mock.patch.object(
-            cli, "mcp_call", return_value=response
+        with mock.patch.object(operations, "supports_duckdb_execution", return_value=False), mock.patch.object(
+            client, "call", return_value=response
         ) as call:
-            cli.run_prepared_query("query-1", "", 30)
+            operations.run_prepared_query(client, "query-1", "", 30)
 
         call.assert_called_once_with("run_query", {"query_id": "query-1"}, timeout_seconds=30)
 
     def test_old_server_duckdb_error_has_upgrade_guidance(self):
         error = urllib.error.HTTPError("http://dekart", 400, "Bad Request", {}, io.BytesIO(b""))
-        with mock.patch.object(cli, "supports_duckdb_execution", return_value=False), mock.patch.object(
-            cli, "mcp_call", side_effect=error
-        ), mock.patch.object(cli, "parse_http_error_body", return_value=("DuckDB queries must use RunDuckDBQuery", None)):
+        with mock.patch.object(operations, "supports_duckdb_execution", return_value=False), mock.patch.object(
+            client, "call", side_effect=error
+        ), mock.patch.object(operations, "parse_http_error_body", return_value=("DuckDB queries must use RunDuckDBQuery", None)):
             with self.assertRaisesRegex(RuntimeError, "newer Dekart server"):
-                cli.run_prepared_query("query-1", "", 30)
+                operations.run_prepared_query(client, "query-1", "", 30)
         error.close()
 
     def test_python_38_does_not_opt_in_before_rejecting_duckdb(self):
         error = urllib.error.HTTPError("http://dekart", 400, "Bad Request", {}, io.BytesIO(b""))
-        with mock.patch.object(cli, "supports_duckdb_execution", return_value=True), mock.patch.object(
+        with mock.patch.object(operations, "supports_duckdb_execution", return_value=True), mock.patch.object(
             cli.sys, "version_info", (3, 8)
-        ), mock.patch.object(cli, "mcp_call", side_effect=error) as call, mock.patch.object(
-            cli, "parse_http_error_body", return_value=("DuckDB queries must use RunDuckDBQuery", None)
+        ), mock.patch.object(client, "call", side_effect=error) as call, mock.patch.object(
+            operations, "parse_http_error_body", return_value=("DuckDB queries must use RunDuckDBQuery", None)
         ):
             with self.assertRaisesRegex(RuntimeError, "Python 3.9"):
-                cli.run_prepared_query("query-1", "", 30)
+                operations.run_prepared_query(client, "query-1", "", 30)
         self.assertNotIn("accept_duckdb_execution", call.call_args.args[1])
         error.close()
 
     def test_failed_capability_discovery_is_not_mislabeled_as_old_server(self):
         error = urllib.error.HTTPError("http://dekart", 400, "Bad Request", {}, io.BytesIO(b""))
-        with mock.patch.object(cli, "supports_duckdb_execution", return_value=None), mock.patch.object(
-            cli, "mcp_call", side_effect=error
+        with mock.patch.object(operations, "supports_duckdb_execution", return_value=None), mock.patch.object(
+            client, "call", side_effect=error
         ), mock.patch.object(
-            cli, "parse_http_error_body", return_value=("DuckDB queries must use RunDuckDBQuery", None)
+            operations, "parse_http_error_body", return_value=("DuckDB queries must use RunDuckDBQuery", None)
         ):
             with self.assertRaisesRegex(RuntimeError, "Could not discover"):
-                cli.run_prepared_query("query-1", "", 30)
+                operations.run_prepared_query(client, "query-1", "", 30)
         error.close()
 
     def test_http_error_body_can_be_read_twice(self):
@@ -144,8 +147,8 @@ class HTTPRequestsTest(unittest.TestCase):
         from urllib.parse import parse_qs, urlsplit
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             cli, "get_dekart_url", return_value="http://localhost:8080"
-        ), mock.patch.object(cli, "download_binary", return_value=b"csv") as download:
-            cli.download_dataset_source("d", "s", "csv", Path(directory) / "http.csv.gz",
+        ), mock.patch.object(client, "_download_binary", return_value=b"csv") as download:
+            operations._download_dataset_source(client, "d", "s", "csv", Path(directory) / "http.csv.gz",
                                         url="https://example.com/a.csv?station=A&B=2")
         self.assertEqual(parse_qs(urlsplit(download.call_args.args[0]).query),
                          {"url": ["https://example.com/a.csv?station=A&B=2"]})
@@ -225,11 +228,11 @@ class PreparedExecutionValidationTest(unittest.TestCase):
 
     def test_requested_query_must_match_root(self):
         result = prepared_result()
-        with mock.patch.object(cli, "supports_duckdb_execution", return_value=True), mock.patch.object(
-            cli, "mcp_call", return_value={"result": result}
+        with mock.patch.object(operations, "supports_duckdb_execution", return_value=True), mock.patch.object(
+            client, "call", return_value={"result": result}
         ):
             with self.assertRaisesRegex(ValueError, "does not match"):
-                cli.run_prepared_query("another-query", "", 30)
+                operations.run_prepared_query(client, "another-query", "", 30)
 
 
 class SourceResolutionTest(unittest.TestCase):
@@ -253,11 +256,11 @@ class SourceResolutionTest(unittest.TestCase):
         metadata = self.metadata()
         pending_job = {"job_status": "JOB_STATUS_RUNNING", "dataset_id": "warehouse-dataset"}
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
-            cli, "wait_for_query_job", return_value=pending_job
-        ), mock.patch.object(cli, "download_binary") as download, mock.patch.object(
+            operations, "wait_for_query_job", return_value=pending_job
+        ), mock.patch.object(client, "_download_binary") as download, mock.patch.object(
             duckdb_execution, "execute_program"
         ) as execute:
-            payload = cli.materialize_duckdb_query(metadata, directory, False, 30, 1)
+            payload = operations.materialize_duckdb_query(client, metadata, directory, False, 30, 1)
 
         self.assertEqual(payload["terminal_status"], "PENDING")
         download.assert_not_called()
@@ -287,10 +290,10 @@ class SourceResolutionTest(unittest.TestCase):
         ]
         for query_job in bad_jobs:
             with self.subTest(query_job=query_job), mock.patch.object(
-                cli, "wait_for_query_job", return_value=query_job
+                operations, "wait_for_query_job", return_value=query_job
             ):
                 with self.assertRaises(ValueError):
-                    cli.prepared_source_jobs(metadata, True, 30, 1)
+                    operations.prepared_source_jobs(client, metadata, True, 30, 1)
 
     def test_file_happy_path_downloads_then_executes(self):
         result = prepared_result()
@@ -307,10 +310,10 @@ class SourceResolutionTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             cli, "get_dekart_url", return_value="https://dekart"
-        ), mock.patch.object(cli, "download_binary", return_value=b"a\n1\n") as download, mock.patch.object(
+        ), mock.patch.object(client, "_download_binary", return_value=b"a\n1\n") as download, mock.patch.object(
             duckdb_execution, "execute_program", side_effect=fake_execute
         ) as execute:
-            payload = cli.materialize_duckdb_query(metadata, directory, True, 30, 1)
+            payload = operations.materialize_duckdb_query(client, metadata, directory, True, 30, 1)
             self.assertTrue(Path(payload["path"]).exists())
 
         self.assertEqual(payload["bytes"], 4)

@@ -20,8 +20,34 @@ from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 from dekart import local_docker
-from dekart import duckdb_execution
+from dekart import client as client_operations
 from dekart.installation_id import get_installation_id
+from dekart.client import (
+    DekartClient,
+    extract_json_path,
+    parse_int,
+    header_get,
+    request_id_from_headers,
+    parse_http_error_body,
+    find_nested_string,
+    extract_structured_error_fields,
+    parse_required_headers,
+    build_put_url,
+    tool_properties,
+    save_binary_file,
+    resolve_job_result_extension,
+    is_terminal_done_status,
+    query_job_status,
+    is_terminal_failed_status,
+    query_job_error,
+    required_nested_scalar,
+)
+
+from dekart.snapshot import (
+    LocalSnapshotRenderError, render_local_snapshot_png, snapshot_expiry_deadline,
+    snapshot_url_debug_summary, print_snapshot_stderr, is_png_snapshot,
+    sanitize_snapshot_diagnostic, snapshot_token_from_render_url,
+)
 
 DEFAULT_DEKART_URL = "https://cloud.dekart.xyz"
 LOCALHOST_DEKART_URL = "http://localhost:8080"
@@ -35,6 +61,12 @@ def build_parser():
         description="Dekart CLI for auth, MCP tools, uploads, and snapshots.",
     )
     subparsers = parser.add_subparsers(dest="command")
+
+    mcp = subparsers.add_parser("mcp", help="MCP server commands.")
+    mcp_commands = mcp.add_subparsers(dest="mcp_command")
+    serve = mcp_commands.add_parser("serve", help="Serve GeoSQL MCP (Python 3.10 or newer).")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
 
     config = subparsers.add_parser("config", help="Set or show Dekart base URL.")
     config.add_argument(
@@ -823,404 +855,6 @@ def check_local_snapshot_runtime():
         return status
 
 
-def snapshot_token_from_render_url(render_url):
-    """Extract snapshot_token query param from snapshot render URL."""
-    try:
-        parsed = urlparse(str(render_url or "").strip())
-    except Exception:
-        return ""
-    if not parsed.query:
-        return ""
-    query = parse_qs(parsed.query, keep_blank_values=False)
-    token_values = query.get("snapshot_token", [])
-    if not token_values:
-        return ""
-    return str(token_values[0]).strip()
-
-
-SNAPSHOT_URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
-SNAPSHOT_QUERY_VALUE_PATTERN = re.compile(
-    r"([?&][A-Za-z0-9_.~%+\-]+)=([^&\s\"'<>]+)",
-    re.IGNORECASE,
-)
-SNAPSHOT_SECRET_FIELD_PATTERN = re.compile(
-    r"([\"']?(?:snapshot_token|access_token|authorization|token|signature|sig|"
-    r"x-goog-signature|x-amz-signature)[\"']?\s*[:=]\s*[\"']?)([^\"'\s,}&]+)",
-    re.IGNORECASE,
-)
-RETRYABLE_SNAPSHOT_ERROR_PHRASES = (
-    "target page, context or browser has been closed",
-    "page crashed",
-)
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-
-
-def redacted_snapshot_netloc(parsed):
-    """Return a URL authority with any userinfo removed."""
-    if "@" not in parsed.netloc:
-        return parsed.netloc
-    return "[REDACTED]@" + parsed.netloc.rsplit("@", 1)[1]
-
-
-def sanitize_snapshot_diagnostic(value):
-    """Redact URL query values and common secret fields from snapshot stderr."""
-    text = str(value or "")
-
-    def redact_url(match):
-        raw_url = match.group(0)
-        trailing = ""
-        while raw_url and raw_url[-1] in ".,;)]}":
-            trailing = raw_url[-1] + trailing
-            raw_url = raw_url[:-1]
-        try:
-            parsed = urlsplit(raw_url)
-            query_keys = []
-            for item in parsed.query.split("&"):
-                key = item.split("=", 1)[0].strip()
-                if key:
-                    query_keys.append(key)
-            redacted_query = "&".join(f"{key}=[REDACTED]" for key in query_keys)
-            redacted_url = urlunsplit(
-                (
-                    parsed.scheme,
-                    redacted_snapshot_netloc(parsed),
-                    parsed.path,
-                    redacted_query,
-                    "",
-                )
-            )
-            return redacted_url + trailing
-        except Exception:
-            return "[REDACTED_URL]" + trailing
-
-    text = SNAPSHOT_URL_PATTERN.sub(redact_url, text)
-    text = SNAPSHOT_QUERY_VALUE_PATTERN.sub(r"\1=[REDACTED]", text)
-    text = SNAPSHOT_SECRET_FIELD_PATTERN.sub(r"\1[REDACTED]", text)
-    return text
-
-
-def snapshot_url_debug_summary(value):
-    """Return a snapshot URL summary containing query names but no values."""
-    try:
-        parsed = urlsplit(str(value or "").strip())
-        query_keys = [item.split("=", 1)[0] for item in parsed.query.split("&") if item]
-        base = urlunsplit(
-            (parsed.scheme, redacted_snapshot_netloc(parsed), parsed.path, "", "")
-        )
-        if query_keys:
-            return f"{base} query_keys={','.join(query_keys)}"
-        return base
-    except Exception:
-        return "[invalid snapshot URL]"
-
-
-def print_snapshot_stderr(message):
-    """Print a sanitized snapshot diagnostic."""
-    print(sanitize_snapshot_diagnostic(message), file=sys.stderr)
-
-
-def snapshot_expiry_deadline(expires_in, response_received_at):
-    """Return a verified monotonic deadline for a positive integer lifetime."""
-    if isinstance(expires_in, bool):
-        return None
-    seconds = None
-    if isinstance(expires_in, int):
-        seconds = expires_in
-    elif isinstance(expires_in, float):
-        if math.isfinite(expires_in) and expires_in.is_integer():
-            seconds = int(expires_in)
-    elif isinstance(expires_in, str):
-        normalized = expires_in.strip()
-        if re.fullmatch(r"\+?\d+", normalized):
-            try:
-                seconds = int(normalized)
-            except (ValueError, OverflowError):
-                return None
-    if seconds is None or seconds <= 0:
-        return None
-    try:
-        deadline = response_received_at + seconds
-    except (TypeError, ValueError, OverflowError):
-        return None
-    if not math.isfinite(deadline):
-        return None
-    return deadline
-
-
-def is_png_snapshot(value):
-    """Return whether snapshot bytes contain the complete PNG signature."""
-    return isinstance(value, (bytes, bytearray)) and value.startswith(PNG_SIGNATURE)
-
-
-def normalized_snapshot_error_message(exc):
-    """Normalize a Playwright error for narrow retry phrase matching."""
-    return " ".join(str(exc or "").lower().split())
-
-
-class LocalSnapshotRenderError(RuntimeError):
-    """Classified local snapshot failure with pre-cleanup evidence."""
-
-    def __init__(
-        self,
-        cause,
-        stage,
-        retryable=False,
-        timed_out=False,
-        page_crashed=False,
-        page_closed=False,
-        browser_disconnected=False,
-        browser_version="",
-        elapsed_seconds=0.0,
-        cleanup_errors=None,
-    ):
-        super().__init__(str(cause))
-        self.cause = cause
-        self.stage = stage
-        self.retryable = bool(retryable)
-        self.timed_out = bool(timed_out)
-        self.page_crashed = bool(page_crashed)
-        self.page_closed = bool(page_closed)
-        self.browser_disconnected = bool(browser_disconnected)
-        self.browser_version = str(browser_version or "")
-        self.elapsed_seconds = float(elapsed_seconds or 0.0)
-        self.cleanup_errors = list(cleanup_errors or [])
-        self.attempts = 1
-        self.retry_skipped_reason = ""
-
-
-def _safe_snapshot_state(callable_value, default=False):
-    """Read Playwright connection state without replacing the primary error."""
-    try:
-        return bool(callable_value())
-    except Exception:
-        return bool(default)
-
-
-def _render_local_snapshot_attempt(
-    render_url,
-    width,
-    height,
-    timeout_seconds,
-    sync_playwright_factory,
-    playwright_timeout_error,
-    monotonic=None,
-):
-    """Perform one local render attempt with evidence capture and cleanup."""
-    clock = monotonic or time.monotonic
-    started_at = clock()
-    manager = None
-    playwright = None
-    browser = None
-    context = None
-    page = None
-    png_bytes = None
-    primary_error = None
-    stage = "launch"
-    browser_version = ""
-    page_crashed = False
-    browser_disconnected = False
-    cleanup_started = False
-    elapsed_seconds = 0.0
-    cleanup_errors = []
-
-    def observe_page_crash(*_args):
-        nonlocal page_crashed
-        if not cleanup_started:
-            page_crashed = True
-
-    def observe_browser_disconnect(*_args):
-        nonlocal browser_disconnected
-        if not cleanup_started:
-            browser_disconnected = True
-
-    try:
-        manager = sync_playwright_factory()
-        playwright = manager.start()
-        browser = playwright.chromium.launch(headless=True)
-        try:
-            browser_version = str(browser.version or "")
-        except Exception:
-            browser_version = ""
-        browser.on("disconnected", observe_browser_disconnect)
-        context = browser.new_context(
-            viewport={"width": width, "height": height},
-            ignore_https_errors=True,
-        )
-        page = context.new_page()
-        page.on("crash", observe_page_crash)
-
-        stage = "navigate"
-        page.goto(render_url, wait_until="domcontentloaded", timeout=timeout_seconds * 1000)
-        snapshot_token = snapshot_token_from_render_url(render_url)
-        stage = "ready"
-        if snapshot_token:
-            page.wait_for_function(
-                "(expectedToken) => window.__dekartSnapshotReadyToken === expectedToken",
-                arg=snapshot_token,
-                timeout=timeout_seconds * 1000,
-            )
-        else:
-            page.wait_for_timeout(1500)
-            for selector in ("canvas", ".kepler-gl", "img"):
-                try:
-                    page.wait_for_selector(selector, timeout=5000)
-                    break
-                except Exception:
-                    continue
-
-        stage = "screenshot"
-        png_bytes = page.screenshot(type="png", timeout=timeout_seconds * 1000)
-        elapsed_seconds = clock() - started_at
-    except Exception as exc:
-        primary_error = exc
-        elapsed_seconds = clock() - started_at
-
-    page_closed = _safe_snapshot_state(page.is_closed) if page is not None else False
-    if browser is not None:
-        browser_disconnected = browser_disconnected or not _safe_snapshot_state(
-            browser.is_connected,
-            default=True,
-        )
-
-    cleanup_started = True
-    for label, resource in (
-        ("context", context),
-        ("browser", browser),
-        ("playwright", playwright),
-    ):
-        if resource is None:
-            continue
-        try:
-            if label == "playwright":
-                resource.stop()
-            else:
-                resource.close()
-        except Exception as exc:
-            cleanup_errors.append(f"{label}: {exc}")
-
-    if primary_error is not None:
-        timed_out = isinstance(primary_error, playwright_timeout_error)
-        normalized_message = normalized_snapshot_error_message(primary_error)
-        message_matches = any(
-            phrase in normalized_message for phrase in RETRYABLE_SNAPSHOT_ERROR_PHRASES
-        )
-        retryable = (
-            not timed_out
-            and browser is not None
-            and (
-                page_crashed
-                or page_closed
-                or browser_disconnected
-                or message_matches
-            )
-        )
-        classified = LocalSnapshotRenderError(
-            primary_error,
-            stage=stage,
-            retryable=retryable,
-            timed_out=timed_out,
-            page_crashed=page_crashed,
-            page_closed=page_closed,
-            browser_disconnected=browser_disconnected,
-            browser_version=browser_version,
-            elapsed_seconds=elapsed_seconds,
-            cleanup_errors=cleanup_errors,
-        )
-        raise classified from primary_error
-
-    return png_bytes, {
-        "stage": stage,
-        "browser_version": browser_version,
-        "elapsed_seconds": elapsed_seconds,
-        "cleanup_errors": cleanup_errors,
-    }
-
-
-def _print_local_snapshot_debug(error, attempt):
-    """Print sanitized failure evidence for one local attempt."""
-    print_snapshot_stderr(
-        "[debug] local_snapshot_attempt={0} stage={1} elapsed_seconds={2:.3f} "
-        "exception_type={3} page_crashed={4} page_closed={5} "
-        "browser_disconnected={6} browser_version={7} platform={8}".format(
-            attempt,
-            error.stage,
-            error.elapsed_seconds,
-            type(error.cause).__name__,
-            str(error.page_crashed).lower(),
-            str(error.page_closed).lower(),
-            str(error.browser_disconnected).lower(),
-            error.browser_version or "unknown",
-            platform.platform(),
-        )
-    )
-    print_snapshot_stderr(f"[debug] local_snapshot_error={error}")
-    for cleanup_error in error.cleanup_errors:
-        print_snapshot_stderr(f"[debug] local_snapshot_cleanup_error={cleanup_error}")
-
-
-def render_local_snapshot_png(
-    render_url,
-    width,
-    height,
-    timeout_seconds,
-    expires_at=None,
-    debug=False,
-    monotonic=None,
-):
-    """Render locally and retry once after verified target termination."""
-    try:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError  # type: ignore
-        from playwright.sync_api import sync_playwright  # type: ignore
-    except Exception as exc:
-        raise RuntimeError("Playwright is not installed. Run `dekart snapshot-local install`.") from exc
-
-    clock = monotonic or time.monotonic
-    for attempt in (1, 2):
-        if debug:
-            print_snapshot_stderr(f"[debug] local_snapshot_attempt={attempt} starting")
-        try:
-            png_bytes, metadata = _render_local_snapshot_attempt(
-                render_url,
-                width,
-                height,
-                timeout_seconds,
-                sync_playwright_factory=sync_playwright,
-                playwright_timeout_error=PlaywrightTimeoutError,
-                monotonic=clock,
-            )
-            if debug:
-                print_snapshot_stderr(
-                    "[debug] local_snapshot_attempt={0} completed "
-                    "elapsed_seconds={1:.3f}".format(
-                        attempt,
-                        metadata.get("elapsed_seconds", 0.0),
-                    )
-                )
-                for cleanup_error in metadata.get("cleanup_errors", []):
-                    print_snapshot_stderr(
-                        f"[debug] local_snapshot_cleanup_error={cleanup_error}"
-                    )
-            return png_bytes
-        except LocalSnapshotRenderError as exc:
-            exc.attempts = attempt
-            if debug:
-                _print_local_snapshot_debug(exc, attempt)
-            if attempt == 1 and exc.retryable:
-                if expires_at is None:
-                    exc.retry_skipped_reason = "unverified_lifetime"
-                    raise
-                if clock() >= expires_at:
-                    exc.retry_skipped_reason = "expired"
-                    raise
-                print_snapshot_stderr(
-                    "Local snapshot target closed; retrying once with a fresh browser."
-                )
-                continue
-            raise
-
-    raise RuntimeError("Local snapshot retry loop ended unexpectedly.")
-
-
 def install_local_snapshot_capability(debug=False, interactive=False):
     """Install local Playwright Chromium capability for snapshot rendering."""
     runtime = check_local_snapshot_runtime()
@@ -1293,32 +927,7 @@ def uninstall_local_snapshot_capability(purge=False):
 
 
 def download_binary(url, timeout_seconds=30, google_passthrough=False):
-    """Download binary payload from URL with optional auth headers."""
-    for attempt in range(2):
-        headers = {"User-Agent": f"dekart-cli/{get_installed_version()}"}
-        auth_headers = get_auth_headers()
-        if auth_headers:
-            headers.update(auth_headers)
-        google_headers = {}
-        if google_passthrough:
-            google_headers = get_optional_google_passthrough_headers(url, force_refresh=attempt > 0)
-            headers.update(google_headers)
-        request = urllib.request.Request(url=url, headers=headers, method="GET")
-        try:
-            response_context = (
-                urlopen_without_redirects(request, timeout_seconds)
-                if google_headers
-                else urllib.request.urlopen(request, timeout=timeout_seconds)
-            )
-            with response_context as response:
-                return response.read()
-        except urllib.error.HTTPError as exc:
-            _raw_body, parsed_body = parse_http_error_body(exc)
-            fields = extract_structured_error_fields(parsed_body)
-            if attempt == 0 and google_headers and fields.get("error") == "google_access_token_invalid":
-                exc.close()
-                continue
-            raise
+    return DekartClient.from_config()._download_binary(url, timeout_seconds, google_passthrough)
 
 
 def parse_yes_no_input(value, default=True):
@@ -1828,41 +1437,6 @@ def write_text_file(path, content):
     target.write_text(content, encoding="utf-8")
 
 
-def extract_json_path(payload, json_path):
-    """Extract value by dot-separated JSON path from payload."""
-    path = str(json_path or "").strip()
-    if not path:
-        raise ValueError("Empty extract path.")
-    if path.startswith("$."):
-        path = path[2:]
-    if path.startswith("$"):
-        path = path[1:]
-    if not path:
-        raise ValueError("Empty extract path.")
-
-    current = payload
-    for segment in path.split("."):
-        key = segment.strip()
-        if not key:
-            raise ValueError(f"Invalid extract path: {json_path}")
-        if isinstance(current, dict):
-            if key not in current:
-                raise ValueError(f"Path not found: {json_path}")
-            current = current[key]
-            continue
-        if isinstance(current, list):
-            try:
-                index = int(key)
-            except ValueError as exc:
-                raise ValueError(f"Expected numeric index in path segment `{key}`.") from exc
-            if index < 0 or index >= len(current):
-                raise ValueError(f"List index out of range in path segment `{key}`.")
-            current = current[index]
-            continue
-        raise ValueError(f"Path segment `{key}` cannot be resolved on scalar value.")
-    return current
-
-
 def format_scalar(value):
     """Format scalar JSON value as plain text."""
     if isinstance(value, bool):
@@ -1874,14 +1448,6 @@ def format_scalar(value):
     if isinstance(value, str):
         return value
     raise ValueError("Extracted value is not scalar.")
-
-
-def parse_int(value, default=0):
-    """Convert protobuf/json numeric field to int with safe fallback."""
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def parse_optional_float(value):
@@ -1897,99 +1463,6 @@ def parse_optional_float(value):
 def is_valid_finite_number(value, minimum, maximum):
     """Return true for finite map viewport numbers inside the server-supported range."""
     return value is not None and math.isfinite(value) and minimum <= value <= maximum
-
-
-def header_get(headers, key):
-    """Read one header value with case-insensitive fallback."""
-    if not headers:
-        return ""
-    value = ""
-    try:
-        value = str(headers.get(key, "")).strip()
-    except Exception:
-        value = ""
-    if value:
-        return value
-    lower_key = str(key).lower()
-    for existing_key in headers.keys():
-        if str(existing_key).lower() == lower_key:
-            return str(headers.get(existing_key, "")).strip()
-    return ""
-
-
-def request_id_from_headers(headers):
-    """Extract best-effort request id from response headers."""
-    for key in ("x-request-id", "x-correlation-id", "x-amzn-requestid", "x-cloud-trace-context"):
-        value = header_get(headers, key)
-        if value:
-            return value
-    return ""
-
-
-def parse_http_error_body(exc):
-    """Read and parse HTTPError response body for diagnostics."""
-    cached = getattr(exc, "_dekart_error_body", None)
-    if cached is not None:
-        return cached
-    raw_text = ""
-    parsed = None
-    try:
-        body = exc.read()
-    except Exception:
-        body = b""
-    if isinstance(body, bytes):
-        raw_text = body.decode("utf-8", errors="replace").strip()
-    elif isinstance(body, str):
-        raw_text = body.strip()
-    if raw_text:
-        try:
-            candidate = json.loads(raw_text)
-            if isinstance(candidate, dict):
-                parsed = candidate
-        except json.JSONDecodeError:
-            parsed = None
-    result = (raw_text, parsed)
-    setattr(exc, "_dekart_error_body", result)
-    return result
-
-
-def find_nested_string(payload, path):
-    """Return nested string by path list, else empty string."""
-    current = payload
-    for segment in path:
-        if not isinstance(current, dict) or segment not in current:
-            return ""
-        current = current.get(segment)
-    if isinstance(current, str):
-        return current.strip()
-    return ""
-
-
-def extract_structured_error_fields(payload):
-    """Extract common error fields from parsed error JSON."""
-    if not isinstance(payload, dict):
-        return {}
-    fields = {}
-    candidates = {
-        "error": (("error",), ("code",), ("status",), ("error", "code"), ("error", "status")),
-        "message": (
-            ("message",),
-            ("detail",),
-            ("error_message",),
-            ("error", "message"),
-            ("error", "detail"),
-            ("error", "error"),
-        ),
-        "path": (("path",), ("field",), ("location",), ("error", "path"), ("error", "field")),
-        "hint": (("hint",), ("suggestion",), ("error", "hint"), ("error", "suggestion")),
-    }
-    for label, path_options in candidates.items():
-        for path in path_options:
-            value = find_nested_string(payload, path)
-            if value:
-                fields[label] = value
-                break
-    return fields
 
 
 def resolve_call_args_source(args_json, args_file, args_stdin):
@@ -2017,41 +1490,10 @@ def resolve_call_args_source(args_json, args_file, args_stdin):
 
 
 def mcp_call(name, args, timeout_seconds=30, return_metadata=False):
-    """Call one MCP tool and return parsed response payload."""
-    dekart_url = get_dekart_url().rstrip("/")
-    endpoint = f"{dekart_url}/api/v1/mcp/call"
-    request_body = json.dumps({"name": name, "arguments": args}).encode("utf-8")
-    for attempt in range(2):
-        headers = {"Content-Type": "application/json", "User-Agent": f"dekart-cli/{get_installed_version()}"}
-        auth_headers = get_auth_headers()
-        if auth_headers:
-            headers.update(auth_headers)
-        google_headers = get_optional_google_passthrough_headers(endpoint, force_refresh=attempt > 0)
-        headers.update(google_headers)
-        request = urllib.request.Request(url=endpoint, data=request_body, headers=headers, method="POST")
-        try:
-            response_context = (
-                urlopen_without_redirects(request, timeout_seconds)
-                if google_headers
-                else urllib.request.urlopen(request, timeout=timeout_seconds)
-            )
-            with response_context as response:
-                body = response.read().decode("utf-8")
-                payload = json.loads(body) if body.strip() else {}
-                if not return_metadata:
-                    return payload
-                return payload, {
-                    "endpoint": endpoint,
-                    "timeout_seconds": timeout_seconds,
-                    "request_id": request_id_from_headers(response.headers),
-                }
-        except urllib.error.HTTPError as exc:
-            _raw_body, parsed_body = parse_http_error_body(exc)
-            fields = extract_structured_error_fields(parsed_body)
-            if attempt == 0 and google_headers and fields.get("error") == "google_access_token_invalid":
-                exc.close()
-                continue
-            raise
+    client = DekartClient.from_config()
+    if return_metadata:
+        return client._call(name, args, timeout_seconds)
+    return client.call(name, args, timeout_seconds)
 
 
 def parse_upload_start_payload(start_response_json, start_response_file):
@@ -2079,173 +1521,15 @@ def parse_upload_start_payload(start_response_json, start_response_file):
 
 
 def upload_part_binary(put_url, body_bytes, required_headers):
-    """Upload one multipart chunk to Dekart part endpoint and return JSON manifest item."""
-    headers = {"Content-Type": "application/octet-stream", "Content-Length": str(len(body_bytes)),
-               "User-Agent": f"dekart-cli/{get_installed_version()}"}
-    auth_headers = get_auth_headers()
-    if auth_headers:
-        headers.update(auth_headers)
-    for item in required_headers or []:
-        key = str(item.get("key", "")).strip()
-        value = str(item.get("value", ""))
-        if key:
-            headers[key] = value
-
-    request = urllib.request.Request(url=put_url, data=body_bytes, headers=headers, method="PUT")
-    with urllib.request.urlopen(request, timeout=120) as response:
-        body = response.read().decode("utf-8")
-        return json.loads(body) if body.strip() else {}
-
-
-def parse_required_headers(required_headers_json):
-    """Parse headers JSON into MCP-compatible key/value list."""
-    if not required_headers_json:
-        return []
-    try:
-        parsed = json.loads(required_headers_json)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid --required-headers-json: {exc}") from exc
-    if not isinstance(parsed, list):
-        raise ValueError("--required-headers-json must be a JSON array.")
-    headers = []
-    for item in parsed:
-        if not isinstance(item, dict):
-            raise ValueError("--required-headers-json items must be objects with key/value.")
-        key = str(item.get("key", "")).strip()
-        value = str(item.get("value", ""))
-        if key:
-            headers.append({"key": key, "value": value})
-    return headers
-
-
-def build_put_url(dekart_url, endpoint_template, part_number, part_size):
-    """Build part upload URL from endpoint template and current part metadata."""
-    if "{part_number}" not in endpoint_template:
-        raise ValueError("upload_part_endpoint must include {part_number}.")
-    endpoint = endpoint_template.replace("{part_number}", str(part_number))
-    base_url = endpoint if endpoint.startswith("http://") or endpoint.startswith("https://") else f"{dekart_url}{endpoint}"
-    separator = "&" if "?" in base_url else "?"
-    return f"{base_url}{separator}part_size={part_size}"
+    return DekartClient.from_config()._upload_part_binary(put_url, body_bytes, required_headers)
 
 
 def upload_parts_from_start_result(local_file, start_result, upload_part_endpoint, required_headers_json, max_part_size, file_id):
-    """Upload local file bytes using one upload session result payload."""
-    file_size = local_file.stat().st_size
-    resolved_endpoint = (upload_part_endpoint or str(start_result.get("upload_part_endpoint", ""))).strip()
-    if not resolved_endpoint:
-        raise ValueError("Missing upload part endpoint. Provide --upload-part-endpoint or start response JSON/file.")
-    resolved_max_part_size = max_part_size if max_part_size and max_part_size > 0 else parse_int(start_result.get("max_part_size"), 0)
-    if resolved_max_part_size <= 0:
-        raise ValueError("Missing max part size. Provide --max-part-size or start response JSON/file.")
-    if required_headers_json:
-        required_headers = parse_required_headers(required_headers_json)
-    else:
-        required_headers = start_result.get("required_headers", [])
-        if not isinstance(required_headers, list):
-            required_headers = []
-    upload_session_id = str(start_result.get("upload_session_id", "")).strip()
-    start_file_id = str(start_result.get("file_id", "")).strip()
-    resolved_file_id = str(file_id or "").strip() or start_file_id
-    if not resolved_file_id:
-        raise ValueError("Missing file id. Provide --file-id or include file_id in start response.")
-    if not upload_session_id:
-        raise ValueError("Missing upload_session_id in start response.")
-    dekart_url = get_dekart_url().rstrip("/")
-
-    parts = []
-    part_number = 1
     with local_file.open("rb") as source:
-        while True:
-            chunk = source.read(resolved_max_part_size)
-            if not chunk:
-                break
-            put_url = build_put_url(dekart_url, resolved_endpoint, part_number, len(chunk))
-            part_response = upload_part_binary(put_url, chunk, required_headers)
-            parts.append(
-                {
-                    "part_number": parse_int(part_response.get("part_number"), part_number),
-                    "etag": str(part_response.get("etag", "")),
-                    "size": parse_int(part_response.get("size"), len(chunk)),
-                }
-            )
-            part_number += 1
-
-    complete_args = {
-        "file_id": resolved_file_id,
-        "upload_session_id": upload_session_id,
-        "parts": parts,
-        "total_size": file_size,
-    }
-    return {
-        "parts": parts,
-        "parts_uploaded": len(parts),
-        "total_size": file_size,
-        "max_part_size": resolved_max_part_size,
-        "upload_session_id": upload_session_id,
-        "file_id": resolved_file_id,
-        "complete_args": complete_args,
-    }
-
-
-def upload_parts_from_bytes(file_bytes, start_result, upload_part_endpoint, required_headers_json, max_part_size, file_id):
-    """Upload in-memory bytes using one upload session result payload."""
-    file_size = len(file_bytes)
-    if file_size <= 0:
-        raise ValueError("File is empty.")
-
-    resolved_endpoint = (upload_part_endpoint or str(start_result.get("upload_part_endpoint", ""))).strip()
-    if not resolved_endpoint:
-        raise ValueError("Missing upload part endpoint. Provide --upload-part-endpoint or start response JSON/file.")
-    resolved_max_part_size = max_part_size if max_part_size and max_part_size > 0 else parse_int(start_result.get("max_part_size"), 0)
-    if resolved_max_part_size <= 0:
-        raise ValueError("Missing max part size. Provide --max-part-size or start response JSON/file.")
-    if required_headers_json:
-        required_headers = parse_required_headers(required_headers_json)
-    else:
-        required_headers = start_result.get("required_headers", [])
-        if not isinstance(required_headers, list):
-            required_headers = []
-    upload_session_id = str(start_result.get("upload_session_id", "")).strip()
-    start_file_id = str(start_result.get("file_id", "")).strip()
-    resolved_file_id = str(file_id or "").strip() or start_file_id
-    if not resolved_file_id:
-        raise ValueError("Missing file id. Provide --file-id or include file_id in start response.")
-    if not upload_session_id:
-        raise ValueError("Missing upload_session_id in start response.")
-    dekart_url = get_dekart_url().rstrip("/")
-
-    parts = []
-    part_number = 1
-    offset = 0
-    while offset < file_size:
-        chunk = file_bytes[offset: offset + resolved_max_part_size]
-        put_url = build_put_url(dekart_url, resolved_endpoint, part_number, len(chunk))
-        part_response = upload_part_binary(put_url, chunk, required_headers)
-        parts.append(
-            {
-                "part_number": parse_int(part_response.get("part_number"), part_number),
-                "etag": str(part_response.get("etag", "")),
-                "size": parse_int(part_response.get("size"), len(chunk)),
-            }
+        return client_operations._upload_parts_from_stream(
+            DekartClient.from_config(), source, local_file.stat().st_size,
+            start_result, upload_part_endpoint, required_headers_json, max_part_size, file_id,
         )
-        offset += len(chunk)
-        part_number += 1
-
-    complete_args = {
-        "file_id": resolved_file_id,
-        "upload_session_id": upload_session_id,
-        "parts": parts,
-        "total_size": file_size,
-    }
-    return {
-        "parts": parts,
-        "parts_uploaded": len(parts),
-        "total_size": file_size,
-        "max_part_size": resolved_max_part_size,
-        "upload_session_id": upload_session_id,
-        "file_id": resolved_file_id,
-        "complete_args": complete_args,
-    }
 
 
 def handle_tools(raw_json, names_only, match, schema_name, arg_keys):
@@ -2322,11 +1606,7 @@ def handle_tools(raw_json, names_only, match, schema_name, arg_keys):
 
 
 def fetch_mcp_tools_payload():
-    """Fetch MCP tool catalog payload from configured Dekart instance."""
-    dekart_url = get_dekart_url().rstrip("/")
-    endpoint = f"{dekart_url}/api/v1/mcp/tools"
-    headers = get_auth_headers()
-    return read_json(endpoint, headers=headers)
+    return DekartClient.from_config().list_tools()
 
 
 def tool_required_fields(tool):
@@ -2334,13 +1614,6 @@ def tool_required_fields(tool):
     schema = tool.get("inputSchema", {}) if isinstance(tool, dict) else {}
     required = schema.get("required", []) if isinstance(schema, dict) else []
     return set(required) if isinstance(required, list) else set()
-
-
-def tool_properties(tool):
-    """Return declared input schema properties for one MCP tool definition."""
-    schema = tool.get("inputSchema", {}) if isinstance(tool, dict) else {}
-    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
-    return set(props.keys()) if isinstance(props, dict) else set()
 
 
 def pick_mcp_tool_name(tools, required_fields=(), required_props=(), preferred_names=(), name_contains=()):
@@ -2673,21 +1946,18 @@ def handle_upload_file(file_path, use_stdin, file_id, name, mime_type, max_part_
             "mime_type": resolve_upload_mime_type(source_name, mime_type),
             "total_size": total_size,
         }
-        start_payload = mcp_call("start_file_upload_session", start_args, timeout_seconds=30)
+        client = DekartClient.from_config()
+        start_payload = client.call("start_file_upload_session", start_args, timeout_seconds=30)
         start_result = start_payload.get("result", {}) if isinstance(start_payload, dict) else {}
         if not isinstance(start_result, dict):
             raise ValueError("Invalid start_file_upload_session response.")
 
-        upload_payload = upload_parts_from_start_result(
-            local_file=staged_file,
-            start_result=start_result,
-            upload_part_endpoint="",
-            required_headers_json="",
-            max_part_size=max_part_size,
-            file_id=file_id,
-        )
+        with staged_file.open("rb") as source:
+            upload_payload = client_operations._upload_parts_from_stream(
+                client, source, total_size, start_result, "", "", max_part_size, file_id,
+            )
         complete_args = upload_payload.get("complete_args", {})
-        complete_payload = mcp_call("complete_file_upload_session", complete_args, timeout_seconds=60)
+        complete_payload = client.call("complete_file_upload_session", complete_args, timeout_seconds=60)
         complete_result = complete_payload.get("result", complete_payload) if isinstance(complete_payload, dict) else complete_payload
 
         payload = {
@@ -2852,14 +2122,6 @@ def resolve_snapshot_output_path(report_id, out):
     return Path(out or default_name).expanduser()
 
 
-def save_binary_file(path, body):
-    """Write raw bytes to file path, creating parent directories."""
-    target = Path(path).expanduser()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(body)
-    return target
-
-
 def build_snapshot_viewport_args(zoom=None, lat=None, lon=None):
     """Validate optional agent-facing snapshot viewport overrides."""
     viewport = {}
@@ -2969,7 +2231,8 @@ def handle_snapshot(
         snapshot_args["include_widgets"] = True
 
     try:
-        snapshot_payload = mcp_call("create_report_snapshot", snapshot_args, timeout_seconds=timeout_seconds)
+        client = DekartClient.from_config()
+        snapshot_payload = client.call("create_report_snapshot", snapshot_args, timeout_seconds=timeout_seconds)
         snapshot_response_received_at = time.monotonic()
     except urllib.error.HTTPError as exc:
         print_snapshot_stderr(f"Snapshot request failed ({exc.code}): {exc.reason}")
@@ -3072,7 +2335,7 @@ def handle_snapshot(
             )
             return 1
         try:
-            png_bytes = download_binary(snapshot_url, timeout_seconds=timeout_seconds)
+            png_bytes = client._download_binary(snapshot_url, timeout_seconds=timeout_seconds)
             source = "remote"
         except urllib.error.HTTPError as exc:
             print_snapshot_stderr(
@@ -3126,112 +2389,6 @@ def handle_snapshot(
         if local_error:
             print(f"Local fallback reason: {local_error}")
     return 0
-
-
-def fetch_query_job(job_id_value, timeout_seconds=30):
-    """Fetch one query job via MCP check_job_status."""
-    payload = mcp_call("check_job_status", {"job_id": job_id_value}, timeout_seconds=timeout_seconds)
-    result = payload.get("result", {}) if isinstance(payload, dict) else {}
-    query_job = result.get("query_job") if isinstance(result, dict) else None
-    if not isinstance(query_job, dict):
-        raise ValueError("check_job_status returned invalid query_job payload.")
-    return query_job
-
-
-def resolve_job_result_extension(query_job):
-    """Resolve output extension from query job payload."""
-    extension = str(query_job.get("result_extension", "")).strip().lower()
-    if extension not in {"csv", "parquet"}:
-        extension = "csv"
-    return extension
-
-
-def is_terminal_done_status(query_job):
-    """Return True when job status indicates results are ready for download."""
-    return query_job_status(query_job) == "JOB_STATUS_DONE"
-
-
-def query_job_status(query_job):
-    """Return a normalized query job status string."""
-    return str(query_job.get("job_status", "")).strip().upper()
-
-
-def is_terminal_failed_status(query_job):
-    """Return True when job status is terminal and cannot produce results."""
-    return query_job_status(query_job) in {"JOB_STATUS_UNSPECIFIED", "UNSPECIFIED", "0"}
-
-
-def query_job_error(query_job):
-    """Return a normalized query job error string."""
-    return str(query_job.get("job_error", "") or query_job.get("jobError", "")).strip()
-
-
-def wait_for_query_job(job_id_value, wait, timeout_seconds, interval_seconds):
-    """Fetch query job status, optionally waiting for terminal DONE."""
-    started = time.time()
-    while True:
-        query_job = fetch_query_job(job_id_value, timeout_seconds=30)
-        error = query_job_error(query_job)
-        if error:
-            raise RuntimeError(error)
-        if is_terminal_failed_status(query_job):
-            status = str(query_job.get("job_status", "")).strip()
-            raise RuntimeError(f"Query job failed with status {status or 'UNKNOWN'}")
-        if not wait or is_terminal_done_status(query_job):
-            return query_job
-        if (time.time() - started) >= timeout_seconds:
-            status = str(query_job.get("job_status", "")).strip()
-            raise TimeoutError(f"Timed out waiting for job completion; last status={status}")
-        time.sleep(interval_seconds)
-
-
-def download_query_job_result(job_id_value, query_job, out, timeout_seconds=60):
-    """Download query job result bytes and save them locally."""
-    source_id = str(query_job.get("job_result_id", "")).strip() or job_id_value
-    dataset_ref = str(query_job.get("dataset_id", "")).strip()
-    if not dataset_ref:
-        raise ValueError("Could not resolve dataset id from job.")
-
-    extension = resolve_job_result_extension(query_job)
-    output_path = Path(out or f"job-{job_id_value}.{extension}").expanduser()
-    saved, size = download_dataset_source(dataset_ref, source_id, extension, output_path, timeout_seconds)
-    return {
-        "job_result_id": source_id,
-        "dataset_ref": dataset_ref,
-        "result_extension": extension,
-        "path": str(saved),
-        "bytes": size,
-    }
-
-
-def download_dataset_source(dataset_id, source_id, extension, output_path, timeout_seconds=60, url=None):
-    """Download one authenticated dataset source to a local path."""
-    dekart_url = get_dekart_url().rstrip("/")
-    source_url = "{0}/api/v1/dataset-source/{1}/{2}.{3}".format(
-        dekart_url,
-        quote(dataset_id, safe=""),
-        quote(source_id, safe=""),
-        extension,
-    )
-    # Computed URLs are checked against the recorded template by the server.
-    if url is not None:
-        source_url += "?" + urlencode({"url": url})
-    body = download_binary(source_url, timeout_seconds=timeout_seconds, google_passthrough=True)
-    return save_binary_file(output_path, body), len(body)
-
-
-def required_nested_scalar(payload, paths, label):
-    """Return first non-empty scalar found at one of the candidate paths."""
-    for path in paths:
-        try:
-            value = extract_json_path(payload, path)
-        except ValueError:
-            continue
-        if isinstance(value, (str, int, float)):
-            text = str(value).strip()
-            if text:
-                return text
-    raise ValueError(f"Could not resolve {label}.")
 
 
 def result_file_path(out_dir, job_id_value, query_job):
@@ -3288,160 +2445,6 @@ def encode_query_params_values(params_json):
             text = str(value)
         encoded.append(("qp_" + name, text))
     return urlencode(encoded)
-
-
-def supports_duckdb_execution():
-    """Discover whether run_query accepts the additive DuckDB opt-in."""
-    try:
-        payload = fetch_mcp_tools_payload()
-    except Exception:
-        return None
-    tools = payload.get("tools", []) if isinstance(payload, dict) else []
-    run_tool = next(
-        (tool for tool in tools if isinstance(tool, dict) and tool.get("name") == "run_query"),
-        None,
-    )
-    return "accept_duckdb_execution" in tool_properties(run_tool)
-
-
-def run_prepared_query(query_id_value, query_params_values, timeout_seconds):
-    """Run a saved query and return either a connection job or DuckDB program."""
-    supports_duckdb = supports_duckdb_execution()
-    can_execute_duckdb = sys.version_info >= (3, 9)
-    arguments = {"query_id": query_id_value}
-    if query_params_values:
-        arguments["query_params_values"] = query_params_values
-    if supports_duckdb and can_execute_duckdb:
-        arguments["accept_duckdb_execution"] = True
-    try:
-        run_payload = mcp_call("run_query", arguments, timeout_seconds=timeout_seconds)
-    except urllib.error.HTTPError as exc:
-        raw_body, _parsed_body = parse_http_error_body(exc)
-        if "RunDuckDBQuery" not in raw_body and "DuckDB" not in raw_body:
-            raise
-        if supports_duckdb is None:
-            raise RuntimeError(
-                "Could not discover DuckDB execution support; retry when the Dekart server is available."
-            ) from exc
-        if supports_duckdb and not can_execute_duckdb:
-            raise RuntimeError("DuckDB query execution requires Python 3.9 or newer.") from exc
-        if not supports_duckdb:
-            raise RuntimeError(
-                "DuckDB execution requires a newer Dekart server; connection queries remain available."
-            ) from exc
-        raise
-    result = run_payload.get("result", {}) if isinstance(run_payload, dict) else {}
-    if isinstance(result, dict) and "duckdb_execution" in result:
-        query_job, execution = duckdb_execution.validate_prepared_execution(result)
-        if str(query_job.get("query_id", "")).strip() != query_id_value:
-            raise ValueError("DuckDB query_job.query_id does not match the requested query.")
-        return {
-            "query_id": query_id_value,
-            "job_id": query_job["id"],
-            "query_job": query_job,
-            "duckdb_execution": execution,
-        }
-    job_id = required_nested_scalar(
-        run_payload,
-        ("result.query_job.id", "result.queryJob.id", "result.job_id", "result.id"),
-        "job id",
-    )
-    return {"query_id": query_id_value, "job_id": job_id}
-
-
-def prepared_source_jobs(metadata, wait, timeout_seconds, interval_seconds):
-    """Poll and validate every exact warehouse source before downloads."""
-    ready_jobs = {}
-    pending = []
-    for source in metadata["duckdb_execution"]["sources"]:
-        source_job_id = str(source.get("query_job_id", "")).strip()
-        if not source_job_id:
-            continue
-        query_job = wait_for_query_job(source_job_id, wait, timeout_seconds, interval_seconds)
-        if not is_terminal_done_status(query_job):
-            pending.append({
-                "job_id": source_job_id,
-                "dataset_id": source["dataset_id"],
-                "job_status": query_job_status(query_job),
-            })
-            continue
-        if str(query_job.get("dataset_id", "")).strip() != source["dataset_id"]:
-            raise ValueError("DuckDB source job dataset_id does not match the prepared source.")
-        result_id = str(query_job.get("job_result_id", "")).strip()
-        if not result_id:
-            raise ValueError("DuckDB source job_result_id is missing.")
-        extension = str(query_job.get("result_extension", "")).strip().lower()
-        if extension != str(source["extension"]).strip().lower():
-            raise ValueError("DuckDB source result_extension does not match the prepared source.")
-        ready_jobs[source_job_id] = query_job
-    return ready_jobs, pending
-
-
-def download_prepared_source(source, index, ready_jobs, directory):
-    """Download one validated file or warehouse revision into the work directory."""
-    dataset_id = str(source["dataset_id"]).strip()
-    extension = str(source["extension"]).strip().lower()
-    source_id = str(source.get("file_source_id", "")).strip()
-    if not source_id:
-        source_job_id = str(source["query_job_id"]).strip()
-        source_id = str(ready_jobs[source_job_id]["job_result_id"]).strip()
-    source_path = Path(directory) / "dekart_source_{0}.{1}".format(index, extension)
-    download_dataset_source(dataset_id, source_id, extension, source_path)
-    return source_path
-
-
-def materialize_duckdb_query(metadata, out_dir, wait, timeout_seconds, interval_seconds):
-    """Resolve prepared inputs and materialize one local DuckDB result."""
-    ready_jobs, pending = prepared_source_jobs(metadata, wait, timeout_seconds, interval_seconds)
-    if pending:
-        return {
-            "query_id": metadata["query_id"],
-            "job_id": metadata["job_id"],
-            "dataset_id": metadata["query_job"]["dataset_id"],
-            "pending_source_jobs": pending,
-            "terminal_status": "PENDING",
-        }
-
-    output_path = Path(out_dir).expanduser() / "{0}.parquet".format(metadata["job_id"])
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="dekart-duckdb-") as directory:
-        source_paths = [
-            download_prepared_source(source, index, ready_jobs, directory)
-            for index, source in enumerate(metadata["duckdb_execution"]["sources"])
-        ]
-        # Keep the recorded suffix, including gzip, for DuckDB format detection.
-        def download_http_source(source, index, resolved_url):
-            source_path = Path(directory) / Path(source["file_name"]).name
-            try:
-                download_dataset_source(
-                    source["dataset_id"], source["http_source_id"], source["extension"],
-                    source_path, timeout_seconds=timeout_seconds, url=resolved_url,
-                )
-            except urllib.error.HTTPError as exc:
-                message, _payload = parse_http_error_body(exc)
-                raise RuntimeError(message) from exc
-            return source_path
-
-        temporary_result = Path(directory) / "dekart_result.parquet"
-        duckdb_execution.execute_program(
-            metadata["duckdb_execution"],
-            metadata["query_job"],
-            source_paths,
-            temporary_result,
-            directory,
-            download_http_source,
-        )
-        shutil.move(str(temporary_result), str(output_path))
-    return {
-        "query_id": metadata["query_id"],
-        "job_id": metadata["job_id"],
-        "dataset_id": metadata["query_job"]["dataset_id"],
-        "terminal_status": "JOB_STATUS_DONE",
-        "result_extension": "parquet",
-        "result_file": str(output_path),
-        "path": str(output_path),
-        "bytes": output_path.stat().st_size,
-    }
 
 
 def print_run_query_result(payload, print_rows, raw_json):
@@ -3593,10 +2596,11 @@ def handle_run_query(query_id, out_dir, deprecated_out, wait, timeout, interval,
 
     try:
         query_params_values = encode_query_params_values(params_json)
-        metadata = run_prepared_query(query_id_value, query_params_values, timeout_seconds=timeout_seconds)
+        client = DekartClient.from_config()
+        metadata = client_operations.run_prepared_query(client, query_id_value, query_params_values, timeout_seconds=timeout_seconds)
         if "duckdb_execution" in metadata:
-            payload = materialize_duckdb_query(
-                metadata,
+            payload = client_operations.materialize_duckdb_query(
+                client, metadata,
                 out_dir_value,
                 wait,
                 timeout_seconds,
@@ -3610,13 +2614,13 @@ def handle_run_query(query_id, out_dir, deprecated_out, wait, timeout, interval,
                 return 0
             print_run_query_result(payload, print_rows, raw_json)
             return 0
-        query_job = wait_for_query_job(metadata["job_id"], wait, timeout_seconds, interval_seconds)
+        query_job = client_operations.wait_for_query_job(client, metadata["job_id"], wait, timeout_seconds, interval_seconds)
         if not is_terminal_done_status(query_job):
             status = str(query_job.get("job_status", "")).strip()
             print(f"Job is not done: {status}", file=sys.stderr)
             return 1
         out_path = result_file_path(out_dir_value, metadata["job_id"], query_job)
-        download = download_query_job_result(metadata["job_id"], query_job, out_path, timeout_seconds=60)
+        download = client_operations.download_query_job_result(client, metadata["job_id"], query_job, out_path, timeout_seconds=60)
         if parse_int(download.get("bytes"), 0) <= 0:
             print("empty result (metadata/SHOW statement?)", file=sys.stderr)
             return 1
@@ -3827,9 +2831,13 @@ def handle_init(no_browser, local_snapshot_mode, bigquery_passthrough_mode="ask"
 
 def main():
     """CLI entrypoint."""
-    send_version_ping()
     parser = build_parser()
     args = parser.parse_args()
+    if args.command == "mcp" and args.mcp_command == "serve":
+        if sys.version_info < (3, 10):
+            parser.exit(2, "dekart mcp serve needs Python 3.10 or newer.\n")
+        parser.exit(2, "The MCP server is not available in this release.\n")
+    send_version_ping()
 
     if args.command == "config":
         raise SystemExit(handle_config(args.url))

@@ -9,6 +9,9 @@ from pathlib import Path
 from unittest import mock
 
 from dekart import cli
+from dekart import client as operations
+
+client = operations.DekartClient("http://localhost:8080", "device")
 
 
 class HandleRunQueryTest(unittest.TestCase):
@@ -29,11 +32,12 @@ class HandleRunQueryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             with ExitStack() as stack:
-                stack.enter_context(mock.patch.object(cli, "mcp_call", side_effect=fake_mcp_call))
-                stack.enter_context(mock.patch.object(cli, "supports_duckdb_execution", return_value=True))
+                stack.enter_context(mock.patch.object(cli.DekartClient, "from_config", return_value=client))
+                stack.enter_context(mock.patch.object(client, "call", side_effect=fake_mcp_call))
+                stack.enter_context(mock.patch.object(operations, "supports_duckdb_execution", return_value=True))
                 wait = stack.enter_context(
                     mock.patch.object(
-                        cli,
+                        operations,
                         "wait_for_query_job",
                         return_value=query_job
                         or {
@@ -47,7 +51,7 @@ class HandleRunQueryTest(unittest.TestCase):
                 )
                 downloader = stack.enter_context(
                     mock.patch.object(
-                        cli,
+                        operations,
                         "download_query_job_result",
                         return_value=download
                         or {
@@ -82,9 +86,9 @@ class HandleRunQueryTest(unittest.TestCase):
             ["run_query"],
         )
         self.assertEqual(calls[0][1], {"query_id": "query-1", "accept_duckdb_execution": True})
-        wait.assert_called_once_with("job-1", True, 300, 5)
+        wait.assert_called_once_with(client, "job-1", True, 300, 5)
         downloader.assert_called_once()
-        self.assertEqual(Path(downloader.call_args.args[2]).name, "result-1.parquet")
+        self.assertEqual(Path(downloader.call_args.args[3]).name, "result-1.parquet")
 
         payload = json.loads(stdout)
         self.assertEqual(payload["dataset_id"], "dataset-1")
@@ -154,9 +158,10 @@ class HandleRunQueryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             with ExitStack() as stack:
-                stack.enter_context(mock.patch.object(cli, "mcp_call", side_effect=fake_mcp_call))
-                stack.enter_context(mock.patch.object(cli, "supports_duckdb_execution", return_value=True))
-                stack.enter_context(mock.patch.object(cli, "download_binary", return_value=b"a,b\n1,2\n"))
+                stack.enter_context(mock.patch.object(cli.DekartClient, "from_config", return_value=client))
+                stack.enter_context(mock.patch.object(client, "call", side_effect=fake_mcp_call))
+                stack.enter_context(mock.patch.object(operations, "supports_duckdb_execution", return_value=True))
+                stack.enter_context(mock.patch.object(client, "_download_binary", return_value=b"a,b\n1,2\n"))
                 stack.enter_context(mock.patch.object(cli, "get_dekart_url", return_value="https://dekart"))
                 stack.enter_context(redirect_stdout(stdout))
                 stack.enter_context(redirect_stderr(stderr))
@@ -456,23 +461,23 @@ class ParserTest(unittest.TestCase):
 class WaitForQueryJobTest(unittest.TestCase):
     def test_wait_fails_fast_on_unspecified_status_without_error(self):
         with mock.patch.object(
-            cli,
+            operations,
             "fetch_query_job",
             return_value={"job_status": "JOB_STATUS_UNSPECIFIED"},
         ) as fetch:
             with self.assertRaisesRegex(RuntimeError, "JOB_STATUS_UNSPECIFIED"):
-                cli.wait_for_query_job("job-1", wait=True, timeout_seconds=300, interval_seconds=5)
+                operations.wait_for_query_job(client, "job-1", wait=True, timeout_seconds=300, interval_seconds=5)
 
-        fetch.assert_called_once_with("job-1", timeout_seconds=30)
+        fetch.assert_called_once_with(client, "job-1", timeout_seconds=30)
 
     def test_wait_fails_fast_on_numeric_unspecified_status_without_error(self):
         with mock.patch.object(
-            cli,
+            operations,
             "fetch_query_job",
             return_value={"job_status": 0},
         ):
             with self.assertRaisesRegex(RuntimeError, "0"):
-                cli.wait_for_query_job("job-1", wait=True, timeout_seconds=300, interval_seconds=5)
+                operations.wait_for_query_job(client, "job-1", wait=True, timeout_seconds=300, interval_seconds=5)
 
 
 if __name__ == "__main__":

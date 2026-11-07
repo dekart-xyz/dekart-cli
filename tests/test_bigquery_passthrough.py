@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from dekart import cli
+from dekart import client as operations
 
 
 class FakeResponse:
@@ -108,7 +109,7 @@ class BigQueryPassthroughConfigTest(unittest.TestCase):
                 mock.Mock(returncode=0, stdout="user@example.com\n", stderr=""),
                 mock.Mock(returncode=0, stdout="(unset)\n", stderr=""),
             ],
-        ), mock.patch.object(
+        ), mock.patch.object(cli, "get_google_bigquery_passthrough_binding", return_value={"gcloud_account": "user@example.com"}), mock.patch.object(
             cli,
             "mint_google_access_token",
             side_effect=RuntimeError(
@@ -325,15 +326,15 @@ class BigQueryPassthroughRequestTest(unittest.TestCase):
         second = FakeResponse(json.dumps({"result": {"ok": True}}).encode("utf-8"))
         with mock.patch.object(cli, "get_dekart_url", return_value="https://dekart.example"), mock.patch.object(
             cli, "get_auth_headers", return_value={"Authorization": "Bearer device"}
-        ), mock.patch.object(
+        ), mock.patch.object(cli, "get_google_bigquery_passthrough_binding", return_value={"gcloud_account": "user@example.com"}), mock.patch.object(
             cli,
-            "get_optional_google_passthrough_headers",
+            "mint_google_access_token",
             side_effect=[
-                {cli.GOOGLE_ACCESS_TOKEN_HEADER: "Bearer google-1"},
-                {cli.GOOGLE_ACCESS_TOKEN_HEADER: "Bearer google-2"},
+                "google-1",
+                "google-2",
             ],
         ) as google_headers, mock.patch.object(
-            cli, "urlopen_without_redirects", side_effect=[first, second]
+            operations, "_urlopen_without_redirects", side_effect=[first, second]
         ) as opener, mock.patch.object(cli.urllib.request, "urlopen") as ordinary:
             payload = cli.mcp_call("run_query", {"query_id": "query-1"})
 
@@ -365,18 +366,18 @@ class BigQueryPassthroughRequestTest(unittest.TestCase):
             cli, "get_dekart_url", return_value="https://dekart.example"
         ), mock.patch.object(
             cli, "get_auth_headers", return_value={"Authorization": "Bearer device"}
-        ), mock.patch.object(
+        ), mock.patch.object(cli, "get_google_bigquery_passthrough_binding", return_value={"gcloud_account": "user@example.com"}), mock.patch.object(
             cli,
-            "get_optional_google_passthrough_headers",
+            "mint_google_access_token",
             side_effect=[
-                {cli.GOOGLE_ACCESS_TOKEN_HEADER: "Bearer google-1"},
-                {cli.GOOGLE_ACCESS_TOKEN_HEADER: "Bearer google-2"},
+                "google-1",
+                "google-2",
             ],
         ) as google_headers, mock.patch.object(
-            cli, "urlopen_without_redirects", side_effect=[first, second]
+            operations, "_urlopen_without_redirects", side_effect=[first, second]
         ) as opener, mock.patch.object(cli.urllib.request, "urlopen") as ordinary:
-            saved, size = cli.download_dataset_source(
-                "dataset-1", "result-1", "csv", Path(directory) / "result.csv"
+            saved, size = operations._download_dataset_source(
+                operations.DekartClient.from_config(), "dataset-1", "result-1", "csv", Path(directory) / "result.csv"
             )
             saved_body = saved.read_bytes()
 

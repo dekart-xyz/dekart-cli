@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from dekart import cli
+from dekart import snapshot
 
 
 PNG = b"\x89PNG\r\n\x1a\nsnapshot"
@@ -81,10 +82,12 @@ class HandleSnapshotUrlTest(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
         with ExitStack() as stack:
+            client = cli.DekartClient("http://localhost:8080", "device")
+            stack.enter_context(mock.patch.object(cli.DekartClient, "from_config", return_value=client))
             mcp_call = stack.enter_context(
                 mock.patch.object(
-                    cli,
-                    "mcp_call",
+                    client,
+                    "call",
                     return_value={"result": snapshot_result},
                     side_effect=mcp_side_effect,
                 )
@@ -112,7 +115,7 @@ class HandleSnapshotUrlTest(unittest.TestCase):
                 )
             )
             download = stack.enter_context(
-                mock.patch.object(cli, "download_binary", return_value=PNG)
+                mock.patch.object(client, "_download_binary", return_value=PNG)
             )
             save = stack.enter_context(
                 mock.patch.object(
@@ -450,7 +453,7 @@ class LocalSnapshotRetryTest(unittest.TestCase):
                 mock.patch.dict(sys.modules, self.playwright_modules())
             )
             stack.enter_context(
-                mock.patch.object(cli, "_render_local_snapshot_attempt", attempt)
+                mock.patch.object(snapshot, "_render_local_snapshot_attempt", attempt)
             )
             stack.enter_context(redirect_stderr(stderr))
             result = cli.render_local_snapshot_png(
@@ -541,7 +544,7 @@ class LocalSnapshotRetryTest(unittest.TestCase):
                 page.goto.side_effect = fail_navigation
 
                 with self.assertRaises(cli.LocalSnapshotRenderError) as raised:
-                    cli._render_local_snapshot_attempt(
+                    snapshot._render_local_snapshot_attempt(
                         "https://example.test/render?snapshot_token=secret",
                         1600,
                         900,
@@ -567,7 +570,7 @@ class LocalSnapshotRetryTest(unittest.TestCase):
         attempt = mock.Mock(side_effect=error)
 
         with mock.patch.dict(sys.modules, self.playwright_modules()), mock.patch.object(
-            cli,
+            snapshot,
             "_render_local_snapshot_attempt",
             attempt,
         ):
@@ -593,7 +596,7 @@ class LocalSnapshotRetryTest(unittest.TestCase):
         attempt = mock.Mock(side_effect=error)
 
         with mock.patch.dict(sys.modules, self.playwright_modules()), mock.patch.object(
-            cli,
+            snapshot,
             "_render_local_snapshot_attempt",
             attempt,
         ):

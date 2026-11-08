@@ -5,7 +5,11 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import socket
+import subprocess
+import sys
 from threading import Thread
+import time
 from unittest import mock
 
 import pytest
@@ -119,6 +123,49 @@ def test_initialize_is_stateless_and_named(client):
     result = rpc(client, "initialize", {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}})
     assert result.json()["result"]["serverInfo"]["name"] == "geosql"
     assert "mcp-session-id" not in result.headers
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+def test_unsupported_methods_leave_server_responding(backend, tmp_path, method):
+    """Exercise the real event loop with bounded waits, including on regression."""
+    import httpx
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    with (tmp_path / "server.log").open("w+") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "dekart", "mcp", "serve", "--port", str(port)],
+            cwd=Path(__file__).resolve().parents[1], stdout=log, stderr=log,
+        )
+        try:
+            with httpx.Client(base_url="http://127.0.0.1:%s" % port, timeout=2, trust_env=False) as client:
+                deadline = time.monotonic() + 10
+                while True:
+                    try:
+                        client.get("/geosql.mcpb")
+                        break
+                    except httpx.ConnectError:
+                        if process.poll() is not None or time.monotonic() >= deadline:
+                            log.seek(0)
+                            pytest.fail("MCP server did not start: " + log.read())
+                        time.sleep(0.05)
+                assert decoded(call(client, "echo", {"value": "before"}))["result"] == {"value": "before"}
+                response = client.request(method, "/mcp", headers=HEADERS)
+                assert response.status_code == 405
+                assert response.headers["allow"] == "POST"
+                assert rpc(client, "initialize", {
+                    "protocolVersion": "2025-03-26", "capabilities": {},
+                    "clientInfo": {"name": "test", "version": "1"},
+                }).json()["result"]["serverInfo"]["name"] == "geosql"
+                assert "echo" in {tool["name"] for tool in rpc(client, "tools/list").json()["result"]["tools"]}
+                assert decoded(call(client, "echo", {"value": "after"}))["result"] == {"value": "after"}
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
 
 
 @pytest.mark.parametrize("enabled", [True, False])

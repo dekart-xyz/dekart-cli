@@ -374,7 +374,8 @@ def create_app():
             return Response("Desktop extension is not installed in this build.", status_code=404)
         return FileResponse(path, filename="geosql.mcpb", media_type="application/octet-stream")
 
-    return Starlette(routes=[Route("/mcp", MCPEndpoint(), methods=["GET", "POST", "DELETE"]),
+    # Stateless JSON requests need no server-to-client stream or session deletion.
+    return Starlette(routes=[Route("/mcp", MCPEndpoint(), methods=["POST"]),
                              Route("/geosql.mcpb", extension)], lifespan=lifespan)
 
 
